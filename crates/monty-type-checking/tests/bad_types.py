@@ -1,0 +1,166 @@
+# This file contains intentional type errors to test the type checker.
+# Each section demonstrates a different category of type error.
+# ===
+
+import decimal
+import functools
+import hashlib
+import sys
+import tomllib
+from typing import TypedDict, assert_type
+
+
+def takes_int(x: int) -> None:
+    pass
+
+
+def takes_str(x: str) -> None:
+    pass
+
+
+def takes_list_int(x: list[int]) -> None:
+    pass
+
+
+# Wrong primitive types
+takes_int('hello')
+takes_int(3.14)
+takes_str(42)
+takes_str([1, 2, 3])
+
+# Wrong container element types
+takes_list_int(['a', 'b', 'c'])
+takes_list_int([1.0, 2.0, 3.0])
+
+
+# === Invalid return types ===
+
+
+def should_return_int() -> int:
+    return 'oops'
+
+
+def should_return_str() -> str:
+    return 123
+
+
+def should_return_list_int() -> list[int]:
+    return ['a', 'b']
+
+
+def should_return_none() -> None:
+    return 42
+
+
+# === Type mismatches in expressions ===
+
+
+def get_int() -> int:
+    return 42
+
+
+def get_str() -> str:
+    return 'hello'
+
+
+# Binary operations with incompatible types
+result1 = get_int() + get_str()
+result2 = get_str() - get_int()
+
+
+# === assert_type failures ===
+
+x: int = 42
+assert_type(x, str)
+
+y: list[int] = [1, 2, 3]
+assert_type(y, list[str])
+
+
+# === Attribute errors ===
+
+
+class MyClass:
+    def __init__(self) -> None:
+        self.value: int = 42
+
+
+obj = MyClass()
+z = obj.nonexistent_attr
+
+
+# === Too many / too few arguments ===
+
+
+def takes_two(a: int, b: str) -> None:
+    pass
+
+
+takes_two(1)
+takes_two(1, 'hello', 'extra')
+
+
+# === Wrong keyword arguments ===
+
+takes_two(a=1, c='wrong')
+
+
+# === Calling non-callable ===
+
+not_callable: int = 42
+not_callable()
+
+
+# === Errors on loop variables ===
+# The loop variable's element type comes through `Iterator.__next__`, which is
+# `@abstractmethod`; without `abc` in the stub tree it is `Unknown` and none of
+# these errors are reported (https://github.com/pydantic/monty/issues/197).
+
+
+class SearchTag(TypedDict):
+    id: str
+
+
+def loop_over_typed_dicts(tags: list[SearchTag]) -> None:
+    for tag in tags:
+        takes_str(tag['uuid'])
+
+
+def loop_over_ints(values: list[int]) -> None:
+    for value in values:
+        takes_str(value)
+
+
+def loop_over_dict_items(mapping: dict[str, int]) -> None:
+    for key, value in mapping.items():
+        takes_int(key)
+        takes_str(value)
+
+
+print(sys.missing)
+hashlib.file_digest
+hashlib.sha256('text')
+tomllib.loads(b'a = 1')
+tomllib.load('pyproject.toml')
+tomllib.loads('a = 1', parse_float=float)
+
+
+# The cached-wrapper stub names its `cache_info()` return type the way typeshed
+# does, `_CacheInfo`; neither CPython nor Monty has a public `CacheInfo`.
+print(functools.CacheInfo)
+
+
+# A cached function keeps the signature it wrapped, so its call sites are
+# checked like any other function's.
+@functools.cache
+def cached_takes_int(n: int) -> int:
+    return n * 2
+
+
+cached_takes_int('nope')
+cached_takes_int(1, 2)
+cached_takes_int(n='nope')
+
+# === decimal: traps and flags take a list or a signal dict, not a tuple ===
+decimal.Context(traps=(decimal.Inexact,))
+decimal.localcontext(flags=(decimal.Rounded,))

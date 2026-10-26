@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "outDir": "dist",
+    "skipLibCheck": false,
+    "lib": ["ES2022", "ESNext.Disposable", "DOM"]
+  },
+  "include": ["test.ts", "node.ts", "wasm-types.ts"]
+}

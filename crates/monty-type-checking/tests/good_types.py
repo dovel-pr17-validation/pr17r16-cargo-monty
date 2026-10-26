@@ -1,0 +1,773 @@
+import asyncio
+import bisect
+import datetime
+import decimal
+import functools
+import hashlib
+import itertools
+import json
+import os
+import random
+import re
+import sys
+import tomllib
+from collections.abc import Iterator
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, LiteralString, assert_type
+
+# === Type checking helper functions ===
+
+
+def check_int(x: int) -> None:
+    pass
+
+
+def check_float(x: float) -> None:
+    pass
+
+
+def check_str(x: str) -> None:
+    pass
+
+
+def check_bool(x: bool) -> None:
+    pass
+
+
+def check_bytes(x: bytes) -> None:
+    pass
+
+
+def check_list_int(x: list[int]) -> None:
+    pass
+
+
+def check_list_str(x: list[str]) -> None:
+    pass
+
+
+def check_tuple_int(x: tuple[int, ...]) -> None:
+    pass
+
+
+def check_dict_str_int(x: dict[str, int]) -> None:
+    pass
+
+
+def check_set_int(x: set[int]) -> None:
+    pass
+
+
+def check_frozenset_int(x: frozenset[int]) -> None:
+    pass
+
+
+# === Value getter functions ===
+
+
+def get_int() -> int:
+    return 123
+
+
+def get_float() -> float:
+    return 3.14
+
+
+def get_str() -> str:
+    return 'hello'
+
+
+def get_list_int() -> list[int]:
+    return [1, 2, 3]
+
+
+def get_list_str() -> list[str]:
+    return ['a', 'b', 'c']
+
+
+def get_object() -> object:
+    return object()
+
+
+def get_dict_str_int() -> dict[str, int]:
+    return {'a': 1, 'b': 2}
+
+
+def get_set_str() -> set[str]:
+    return {'a', 'b', 'c'}
+
+
+def get_frozenset_str() -> frozenset[str]:
+    return frozenset({'a', 'b', 'c'})
+
+
+def get_tuple_str_int() -> tuple[str, int]:
+    return ('hello', 42)
+
+
+def get_bytes() -> bytes:
+    return b'hello'
+
+
+# === Core Types ===
+
+obj = object()
+t = type(42)
+
+
+# === Primitive Types ===
+
+# bool
+check_bool(True)
+check_bool(False)
+check_bool(bool(1))
+check_bool(bool(''))
+
+# int
+check_int(42)
+check_int(int('42'))
+check_int(int(3.14))
+check_int(int(get_int()))
+check_int(int(get_float()))
+
+# float
+check_float(3.14)
+check_float(float('3.14'))
+check_float(float(42))
+f = get_float()
+assert_type(f, float)
+
+
+# === String and Bytes Types ===
+
+# str
+check_str('hello')
+check_str(str(42))
+check_str(str(b'hello', 'utf-8'))
+check_str(str(get_int()))
+
+# bytes
+check_bytes(b'hello')
+check_bytes(bytes('hello', 'utf-8'))
+check_bytes(bytes(10))
+check_bytes(bytes([65, 66, 67]))
+check_bytes(bytes(get_int()))
+k2 = get_bytes()
+assert_type(k2, bytes)
+
+
+# === Container Types ===
+
+# list
+check_list_int([1, 2, 3])
+check_list_str(list('abc'))
+check_list_int(list(range(10)))
+m2 = get_list_int()
+assert_type(m2, list[int])
+m3 = get_list_str()
+assert_type(m3, list[str])
+
+# tuple
+check_tuple_int(tuple([1, 2, 3]))
+p2 = get_tuple_str_int()
+assert_type(p2, tuple[str, int])
+
+# dict
+check_dict_str_int({'a': 1, 'b': 2})
+check_dict_str_int(dict(a=1, b=2))
+d = get_dict_str_int()
+assert_type(d, dict[str, int])
+
+# set
+check_set_int({1, 2, 3})
+check_set_int(set([1, 2, 3]))
+
+# frozenset
+check_frozenset_int(frozenset([1, 2, 3]))
+
+# range
+w = range(get_int())
+assert_type(w, range)
+
+# slice
+sl1 = slice(10)
+sl2 = slice(0, 10)
+sl3 = slice(0, 10, 2)
+
+
+# === Builtin Functions ===
+
+# abs
+check_int(abs(-5))
+check_float(abs(-3.14))
+
+# all / any
+check_bool(all([True, False]))
+check_bool(any([True, False]))
+aa = all(get_list_int())
+assert_type(aa, bool)
+
+# bin / hex / oct
+check_str(bin(42))
+check_str(hex(255))
+check_str(oct(8))
+ac = bin(get_int())
+assert_type(ac, str)
+
+# chr / ord
+check_str(chr(65))
+check_int(ord('A'))
+af = chr(get_int())
+assert_type(af, str)
+ag = ord(get_str())
+assert_type(ag, int)
+
+# divmod
+dm = divmod(10, 3)
+
+# hash
+check_int(hash('hello'))
+ai = hash(get_str())
+assert_type(ai, int)
+
+# id
+check_int(id(object()))
+ak = id(get_object())
+assert_type(ak, int)
+
+# isinstance
+check_bool(isinstance(42, int))
+al = isinstance(get_object(), int)
+assert_type(al, bool)
+
+# len
+check_int(len([1, 2, 3]))
+an = len(get_list_int())
+assert_type(an, int)
+
+# max / min
+check_int(max(1, 2, 3))
+check_int(min(1, 2, 3))
+
+# pow
+check_int(pow(2, 3))
+check_float(pow(2.0, 3.0))
+
+# print
+aw = print(get_str())
+assert_type(aw, None)
+
+# repr
+check_str(repr(42))
+ax = repr(get_int())
+assert_type(ax, str)
+
+# round
+check_int(round(3.7))
+
+# sorted
+check_list_int(sorted([3, 1, 2]))
+
+# sum
+check_int(sum([1, 2, 3]))
+ba = sum(get_list_int())
+assert_type(ba, int)
+
+# type
+bf = type(get_int())
+assert_type(bf, type[int])
+
+
+# === Iterator Types ===
+
+# enumerate
+for i_enum, v_enum in enumerate([1, 2, 3]):
+    check_int(i_enum)
+    check_int(v_enum)
+
+# reversed
+for v_rev in reversed([1, 2, 3]):
+    check_int(v_rev)
+
+# zip
+for a_zip, b_zip in zip([1, 2], ['a', 'b']):
+    check_int(a_zip)
+    check_str(b_zip)
+
+
+# === Literal Types ===
+
+bk = None
+assert_type(bk, None)
+
+
+# === Exception Types ===
+
+e1 = BaseException('error')
+e2 = Exception('error')
+e3 = SystemExit(1)
+e4 = KeyboardInterrupt()
+e5 = ArithmeticError('error')
+e6 = OverflowError('error')
+e7 = ZeroDivisionError('error')
+e8 = LookupError('error')
+e9 = IndexError('error')
+e10 = KeyError('key')
+e11 = RuntimeError('error')
+e12 = NotImplementedError('error')
+e13 = RecursionError('error')
+e14 = AttributeError('error')
+e15 = AssertionError('error')
+e16 = MemoryError('error')
+e17 = NameError('error')
+e18 = SyntaxError('error')
+e19 = TimeoutError('error')
+e20 = TypeError('error')
+e21 = ValueError('error')
+e22 = StopIteration()
+
+
+# === Exception Inheritance ===
+
+
+def handle_base(e: BaseException) -> None:
+    pass
+
+
+handle_base(Exception('error'))
+handle_base(ValueError('error'))
+handle_base(KeyError('key'))
+handle_base(ZeroDivisionError('error'))
+
+
+def handle_exception(e: Exception) -> None:
+    pass
+
+
+handle_exception(ValueError('error'))
+handle_exception(TypeError('error'))
+handle_exception(RuntimeError('error'))
+
+
+# === Try/Except ===
+
+try:
+    x_try = 1 / 0
+except ZeroDivisionError as e_try:
+    check_str(str(e_try))
+
+try:
+    d_try: dict[str, int] = {}
+    v_try = d_try['missing']
+except KeyError:
+    pass
+
+try:
+    lst_try: list[int] = []
+    v_lst = lst_try[0]
+except IndexError:
+    pass
+
+
+# === Raise ===
+
+
+def may_fail(x_fail: int) -> int:
+    if x_fail < 0:
+        raise ValueError('x must be non-negative')
+    if x_fail == 0:
+        raise ZeroDivisionError('x cannot be zero')
+    return 100 // x_fail
+
+
+def not_implemented() -> None:
+    raise NotImplementedError('subclass must implement')
+
+
+print(sys.version)
+print(sys.version_info)
+print(sys.argv[0])
+print(sys.maxsize + sys.maxunicode + sys.hexversion + sys.api_version)
+print(sys.byteorder, sys.copyright, sys.platlibdir, sys.abiflags)
+print(sys.executable, sys.prefix, sys.exec_prefix, sys.base_prefix, sys.base_exec_prefix)
+print(sys.dont_write_bytecode, sys.pycache_prefix, sys.builtin_module_names)
+print(sys.float_repr_style, sys.float_info.epsilon, sys.float_info.mant_dig)
+print(sys.flags.optimize, sys.flags.dev_mode, sys.flags.int_max_str_digits)
+print(None, file=sys.stdout)
+print(None, file=sys.stderr)
+
+# === async ===
+
+
+async def foo(a: int):
+    return a * 2
+
+
+async def bar():
+    await foo(1)
+    await foo(2)
+    await foo(3)
+
+
+await asyncio.gather(bar())  # pyright: ignore
+
+asyncio.run(foo(1))
+
+
+@dataclass
+class Point:
+    x: int
+    y: float
+
+
+p = Point(1, 2)
+assert_type(p.x, int)
+assert_type(p.y, float)
+p.x = 3
+print(p)
+
+path = Path(__file__)
+assert_type(path, Path)
+# assert_type(path.name, str)
+
+p2 = path.parent
+assert_type(p2, Path)
+
+p3 = path / 'test.txt'
+assert_type(p3, Path)
+assert p3.name == 'test.txt'
+
+x = os.getenv('foobar')
+assert_type(x, str | None)
+
+y = os.getenv('foobar', default=int('123'))
+assert_type(y, str | int)
+
+x2 = os.environ.get('foobar')
+assert_type(x2, str | None)
+
+joined = os.path.join('a', 'b')
+assert_type(joined, LiteralString)
+assert_type(os.path.join(str(1), 'b'), str)
+assert_type(os.path.join(Path('a'), 'b'), str)
+assert_type(os.path.join(b'a', b'b'), bytes)
+assert_type(os.path.splitext(str(1)), tuple[str, str])
+assert_type(os.path.split(Path('a/b')), tuple[str, str])
+assert_type(os.path.exists('a'), bool)
+assert_type(os.path.exists(3), bool)
+assert_type(os.path.getsize(Path('a')), int)
+assert_type(os.path.getmtime('a'), float)
+assert_type(os.path.realpath('a'), str)
+assert_type(os.path.relpath('/a/b', '/a'), LiteralString)
+assert_type(os.path.relpath(Path('/a/b'), '/a'), str)
+assert_type(os.path.commonpath(['/a/b', '/a/c']), LiteralString)
+assert_type(os.path.commonpath([Path('/a/b'), '/a/c']), str)
+assert_type(os.path.commonprefix(['ab', 'ac']), LiteralString)
+assert_type(os.path.commonprefix([Path('ab'), 'ac']), str)
+assert_type(os.path.normpath(b'a//b'), bytes)
+assert_type(os.path.samestat(os.stat('a'), os.stat('b')), bool)
+assert_type(os.path.sep + str(1), str)
+assert_type(os.pathsep, str)
+
+
+# === re module ===
+
+# re.search returns Match or None
+s1 = re.search(r'\d+', 'abc 42')
+assert_type(s1, re.Match[str] | None)
+
+# re.match returns Match or None
+s2 = re.match(r'\w+', 'hello')
+assert_type(s2, re.Match[str] | None)
+
+# re.fullmatch returns Match or None
+s3 = re.fullmatch(r'\w+', 'hello')
+assert_type(s3, re.Match[str] | None)
+
+# re.compile returns Pattern
+p_re = re.compile(r'\d+')
+assert_type(p_re, re.Pattern[str])
+
+# re.findall returns list of Any
+fa = re.findall(r'\d+', 'a1 b2 c3')
+assert_type(fa, list[Any])
+
+# re.sub returns str
+s4 = re.sub(r'\d+', 'X', 'a1 b2')
+assert_type(s4, str)
+
+# Pattern.search returns Match or None
+p_re2 = re.compile(r'(\w+)')
+s5 = p_re2.search('hello world')
+assert_type(s5, re.Match[str] | None)
+
+# Pattern.match returns Match or None
+s6 = p_re2.match('hello world')
+assert_type(s6, re.Match[str] | None)
+
+# Pattern.sub returns str
+s7 = p_re2.sub('X', 'hello world')
+assert_type(s7, str)
+
+# Pattern.findall returns list of Any
+fa2 = p_re2.findall('hello world')
+assert_type(fa2, list[Any])
+
+
+# === datetime module ===
+
+# date construction
+dt_date = datetime.date(2024, 1, 15)
+assert_type(dt_date, datetime.date)
+
+# date properties
+check_int(dt_date.year)
+check_int(dt_date.month)
+check_int(dt_date.day)
+
+# date methods
+check_str(dt_date.isoformat())
+check_str(dt_date.strftime('%Y-%m-%d'))
+check_int(dt_date.weekday())
+check_int(dt_date.isoweekday())
+check_int(dt_date.toordinal())
+check_str(dt_date.ctime())
+
+# date classmethods (return Unknown due to type checker limitations)
+datetime.date.today()
+datetime.date.fromisoformat('2024-01-15')
+datetime.date.fromordinal(738900)
+
+# date replace
+dt_replaced = dt_date.replace(year=2025)
+assert_type(dt_replaced, datetime.date)
+
+# date arithmetic
+dt_delta = datetime.timedelta(days=1)
+dt_date2 = dt_date + dt_delta
+assert_type(dt_date2, datetime.date)
+dt_diff = dt_date - dt_date
+assert_type(dt_diff, datetime.timedelta)
+
+# time construction
+dt_time = datetime.time(12, 30, 45)
+assert_type(dt_time, datetime.time)
+
+# time properties
+check_int(dt_time.hour)
+check_int(dt_time.minute)
+check_int(dt_time.second)
+check_int(dt_time.microsecond)
+
+# time methods
+check_str(dt_time.isoformat())
+check_str(dt_time.strftime('%H:%M:%S'))
+
+# time replace
+dt_time2 = dt_time.replace(hour=14)
+assert_type(dt_time2, datetime.time)
+
+# timedelta construction
+td = datetime.timedelta(days=5, hours=3, minutes=30)
+assert_type(td, datetime.timedelta)
+
+# timedelta properties
+check_int(td.days)
+check_int(td.seconds)
+check_int(td.microseconds)
+
+# timedelta methods
+check_float(td.total_seconds())
+
+# timedelta arithmetic
+td2 = td + td
+assert_type(td2, datetime.timedelta)
+td3 = td - td
+assert_type(td3, datetime.timedelta)
+td4 = td * 2
+assert_type(td4, datetime.timedelta)
+
+# datetime construction
+dt = datetime.datetime(2024, 1, 15, 12, 30, 45)
+assert_type(dt, datetime.datetime)
+
+# datetime properties
+check_int(dt.year)
+check_int(dt.month)
+check_int(dt.day)
+check_int(dt.hour)
+check_int(dt.minute)
+check_int(dt.second)
+check_int(dt.microsecond)
+
+# datetime methods
+check_str(dt.isoformat())
+check_str(dt.strftime('%Y-%m-%d %H:%M:%S'))
+check_float(dt.timestamp())
+dt_d = dt.date()
+assert_type(dt_d, datetime.date)
+dt_t = dt.time()
+assert_type(dt_t, datetime.time)
+
+# datetime classmethods (return Unknown due to type checker limitations)
+datetime.datetime.now()
+datetime.datetime.strptime('2024-01-15', '%Y-%m-%d')
+datetime.datetime.fromtimestamp(1000000.0)
+
+# datetime replace
+dt_rep = dt.replace(year=2025)
+assert_type(dt_rep, datetime.datetime)
+
+# timezone
+utc = datetime.timezone.utc
+assert_type(utc, datetime.timezone)
+tz = datetime.timezone(datetime.timedelta(hours=5))
+assert_type(tz, datetime.timezone)
+
+assert_type(json.loads('null'), Any)
+assert_type(json.dumps(None), str)
+
+# === tomllib ===
+assert_type(tomllib.loads('a = 1'), dict[str, Any])
+with Path('pyproject.toml').open('rb') as toml_file:
+    assert_type(tomllib.load(toml_file), dict[str, Any])
+try:
+    tomllib.loads('?')
+except tomllib.TOMLDecodeError as toml_exc:
+    check_str(str(toml_exc))
+
+# === decimal ===
+price = decimal.Decimal('19.99')
+assert_type(price * 3, decimal.Decimal)
+assert_type(price + 1, decimal.Decimal)
+assert_type(1 - price, decimal.Decimal)
+assert_type(price.quantize(decimal.Decimal('0.1'), rounding=decimal.ROUND_HALF_UP), decimal.Decimal)
+assert_type(round(price), int)
+assert_type(round(price, 1), decimal.Decimal)
+assert_type(int(price), int)
+check_float(float(price))
+assert_type(price < 20, bool)
+assert_type(price.as_tuple(), decimal.DecimalTuple)
+assert_type(price.sqrt(), decimal.Decimal)
+assert_type(decimal.getcontext().prec, int)
+assert_type(decimal.getcontext().flags[decimal.Inexact], bool)
+with decimal.localcontext(prec=50) as decimal_ctx:
+    assert_type(decimal_ctx, decimal.Context)
+# `traps` and `flags` take a list of signals as well as a signal dict
+assert_type(decimal.Context(traps=[decimal.InvalidOperation], flags=[]), decimal.Context)
+try:
+    decimal.Decimal('abc')
+except decimal.InvalidOperation as decimal_exc:
+    check_str(str(decimal_exc))
+
+# === iter() / next() ===
+# Element types must survive the `Iterator` protocol: `Iterator.__next__` is
+# decorated `@abstractmethod`, so a stub tree missing `abc` degrades every one
+# of these to `Unknown` and silently disables checking inside `for` loops.
+it = iter([1, 2, 3])
+assert_type(it, Iterator[int])
+assert_type(next(it), int)
+assert_type(next(it, 0), int)
+assert_type(list(it), list[int])
+assert_type(sorted([1, 2]), list[int])
+for x_it in iter([1, 2, 3]):
+    assert_type(x_it, int)
+# two-argument iter(callable, sentinel)
+assert_type(list(iter(lambda: 0, 0)), list[int])
+
+# Guards the `Generic[_T]` base on Monty's stripped `functools.pyi`: without it
+# this annotation is a `not-subscriptable` error. ty models `partial` calls
+# itself, so the return type is not the stub's to get wrong.
+partial_ann: functools.partial[list[int]] = functools.partial(get_list_int)
+
+
+# The cached wrapper's return type comes from the wrapped function, and
+# `cache_info()` from the stub's `_CacheInfo`.
+@functools.cache
+def cached_double(n: int) -> int:
+    return n * 2
+
+
+assert_type(cached_double(2), int)
+assert_type(cached_double.cache_info().hits, int)
+assert_type(cached_double.cache_info().currsize, int)
+assert_type(cached_double.__wrapped__(2), int)
+
+
+# Keyword arguments and defaults come through the wrapper too, in every
+# decorator form.
+@functools.lru_cache(maxsize=2)
+def cached_repeat(a: int, b: str = 'x') -> str:
+    return b * a
+
+
+assert_type(cached_repeat(2), str)
+assert_type(cached_repeat(2, 'y'), str)
+assert_type(cached_repeat(2, b='y'), str)
+assert_type(functools.lru_cache(get_list_int)(), list[int])
+
+# Loop variables keep their element type for every iterable, not just lists
+for x_list in get_list_int():
+    assert_type(x_list, int)
+for k_dict, v_dict in {'a': 1}.items():
+    assert_type(k_dict, str)
+    assert_type(v_dict, int)
+assert_type([y_comp for y_comp in [1, 2]], list[int])
+
+# `itertools`: the combinatoric iterators yield tuples, `groupby` yields
+# `(key, group)` pairs whose group iterates the source's items, and
+# `chain.from_iterable` flattens one level. `r` is a variable rather than a
+# literal because this file is also checked against upstream typeshed, whose
+# per-arity overloads would give a fixed-width tuple for a literal.
+combination_r = len([1, 2])
+assert_type(next(itertools.combinations([1, 2], combination_r)), tuple[int, ...])
+assert_type(next(itertools.combinations_with_replacement([1, 2], combination_r)), tuple[int, ...])
+assert_type(next(itertools.permutations([1, 2])), tuple[int, ...])
+assert_type(next(itertools.permutations([1, 2], combination_r)), tuple[int, ...])
+# `chain.from_iterable` is deliberately not asserted: upstream typeshed
+# declares it as a classmethod, whose element type ty does not carry through.
+for key, group in itertools.groupby([1, 1, 2]):
+    assert_type(key, int)
+    assert_type(list(group), list[int])
+for key_fn, group_fn in itertools.groupby([1, 1, 2], key=lambda i: i > 1):
+    assert_type(key_fn, bool)
+    assert_type(list(group_fn), list[int])
+
+# === hashlib ===
+assert_type(hashlib.sha256(b'abc').hexdigest(), str)
+assert_type(hashlib.md5(b'abc').digest(), bytes)
+assert_type(hashlib.new('sha1', b'abc').digest_size, int)
+# Monty's stub overloads `new()` by name; upstream typeshed (which basedpyright uses) returns `HASH` for every name
+assert_type(hashlib.new('shake_256', b'abc').hexdigest(8), str)  # pyright: ignore
+assert_type(hashlib.new('blake2b', b'abc', digest_size=16).hexdigest(), str)  # pyright: ignore
+check_int(hashlib.new('blake2s').MAX_KEY_SIZE)  # pyright: ignore
+assert_type(hashlib.shake_128(b'abc').hexdigest(8), str)
+assert_type(hashlib.blake2b(b'abc', digest_size=16, key=b'k').hexdigest(), str)
+assert_type(hashlib.blake2s().copy().name, str)
+check_int(hashlib.blake2b.MAX_DIGEST_SIZE)
+assert_type(hashlib.pbkdf2_hmac('sha256', b'pw', b'salt', 1000), bytes)
+for algorithm in hashlib.algorithms_guaranteed:
+    check_str(algorithm)
+hashlib.sha256().update(b'more')
+
+# === random ===
+assert_type(random.random(), float)
+assert_type(random.randint(1, 6), int)
+assert_type(random.choice([1, 2, 3]), int)
+assert_type(random.sample(['a', 'b'], 1), list[str])
+assert_type(random.choices('abc', k=2), list[str])
+assert_type(random.Random(42).uniform(1, 2), float)
+assert_type(random.Random().getrandbits(8), int)
+assert_type(os.urandom(4), bytes)
+
+
+# === bisect ===
+
+assert_type(bisect.bisect_left([1, 2, 3], 2), int)
+assert_type(bisect.bisect_right((1, 2), 2, hi=None), int)
+assert_type(bisect.bisect([1, 2], 2, lo=False), int)
+assert_type(bisect.bisect_left([(1, 'a')], 1, key=lambda row: row[0]), int)
+assert_type(bisect.insort_left([1, 2], 2), None)
+assert_type(bisect.insort_right([(1, 'a')], (2, 'b'), key=lambda row: row[0]), None)
+assert_type(bisect.insort([1, 2], 3), None)

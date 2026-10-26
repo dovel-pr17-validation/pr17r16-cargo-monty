@@ -1,0 +1,20 @@
+{
+  "name": "monty-smoke-test",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "type-check": "tsc --noEmit",
+    "test": "npm run test:node && npm run test:browser",
+    "test:node": "tsc && node dist/node.js",
+    "test:browser": "vitest --config vitest.browser.config.ts run"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.1",
+    "@types/node": "^20.0.0",
+    "@vitest/browser": "^3.2.4",
+    "typescript": "^5.9.2",
+    "vite": "^6.3.5",
+    "vitest": "^3.2.4"
+  }
+}

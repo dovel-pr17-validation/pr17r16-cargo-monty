@@ -1,0 +1,56 @@
+export declare function _flushTelemetry(): Promise<void>
+
+export declare function _installTelemetry(
+  callback: (event: string) => boolean,
+  metricsCallback: (event: string) => boolean,
+  metricsEnabled: boolean,
+): void
+
+export declare function _montyVersion(): string
+
+export declare function _setTelemetryMetricsEnabled(enabled: boolean): void
+
+export interface NativeMount {
+  virtualPath: string
+  hostPath: string
+  mode?: string
+  writeBytesLimit?: number
+  memoryUsageLimit?: number
+}
+
+export declare class NativeMountDir {
+  constructor(mount: NativeMount)
+  get memoryUsageLimit(): number
+  close(): void
+}
+
+export declare class NativePool {
+  constructor(options?: unknown)
+  static websocket(options?: unknown): NativePool
+  start(): Promise<void>
+  checkout(options?: unknown): NativeSession
+  close(): Promise<void>
+}
+
+export declare class NativeSession {
+  readonly workerId?: number
+  readonly workerPid?: number
+  readonly sessionId?: Uint8Array | null
+  enter(telemetryContext?: unknown, connectHeaders?: unknown): Promise<object>
+  feed(...args: unknown[]): Promise<object>
+  feedStart(...args: unknown[]): Promise<object>
+  restore(...args: unknown[]): Promise<object>
+  dump(...args: unknown[]): Promise<object>
+  finish(): Promise<void>
+  installDependencies(...args: unknown[]): Promise<object>
+  resumeReturn(...args: unknown[]): Promise<object>
+  resumeError(...args: unknown[]): Promise<object>
+  resumeNotFound(...args: unknown[]): Promise<object>
+  resumeNotHandled(...args: unknown[]): Promise<object>
+  resumeFromMounts(...args: unknown[]): Promise<object>
+  resumeFuture(...args: unknown[]): Promise<object>
+  resumeNameLookup(...args: unknown[]): Promise<object>
+  resumeLazyAttr(...args: unknown[]): Promise<object>
+  resumeNameLookupError(...args: unknown[]): Promise<object>
+  resolveFutures(...args: unknown[]): Promise<object>
+}

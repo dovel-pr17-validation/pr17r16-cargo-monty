@@ -1,0 +1,531 @@
+package pydantic:monty;
+
+/// Drives one persistent Monty child through semantic component calls.
+interface worker {
+    /// Whether the component can accept another request after this turn.
+    enum status {
+        /// The child remains ready for another turn.
+        continue,
+        /// The child reached a fatal error or clean shutdown.
+        shutdown,
+    }
+
+    /// A pair of indexes into a message's node arena.
+    record node-pair {
+        /// Index of the key node.
+        key: u32,
+        /// Index of the value node.
+        value: u32,
+    }
+
+    /// Named-tuple metadata plus indexes of its values.
+    record named-tuple-node {
+        /// Python type name used by repr.
+        type-name: string,
+        /// Attribute names corresponding to `items`.
+        field-names: list<string>,
+        /// Indexes of tuple values.
+        items: list<u32>,
+    }
+
+    /// Components of a Python `datetime.date`.
+    record date-node {
+        year: s32,
+        month: u8,
+        day: u8,
+    }
+
+    /// Components of a Python `datetime.datetime`.
+    record datetime-node {
+        year: s32,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+        microsecond: u32,
+        offset-seconds: option<s32>,
+        timezone-name: option<string>,
+    }
+
+    /// Components of a Python `datetime.time`.
+    record time-node {
+        hour: u8,
+        minute: u8,
+        second: u8,
+        microsecond: u32,
+        offset-seconds: option<s32>,
+        timezone-name: option<string>,
+        fold: u8,
+    }
+
+    /// Normalized components of a Python `datetime.timedelta`.
+    record timedelta-node {
+        days: s32,
+        seconds: s32,
+        microseconds: s32,
+    }
+
+    /// A Python complex as its two float parts.
+    record complex-node {
+        real: f64,
+        imag: f64,
+    }
+
+    /// A fixed-offset Python timezone.
+    record timezone-node {
+        offset-seconds: s32,
+        name: option<string>,
+    }
+
+    /// A simple exception value without a traceback.
+    record exception-value-node {
+        exc-type: string,
+        message: option<string>,
+    }
+
+    /// A sandbox file handle represented only by virtual state.
+    record file-handle-node {
+        path: string,
+        mode: string,
+        position: u64,
+    }
+
+    /// A class type object (`type` is a WIT keyword, hence the name). The
+    /// real class lives on whichever side generated `id`.
+    record class-type-node {
+        name: string,
+        /// Canonical lowercase uuid string.
+        id: string,
+        host-defined: bool,
+        is-dataclass: bool,
+        /// Eagerly-sent class attributes (class constants), as a class value
+        /// or as the class-type of an instance; a non-empty set refreshes the
+        /// sandbox's type object. Empty when the worker sends an instance.
+        attrs: list<node-pair>,
+    }
+
+    /// A class instance and indexes of its attribute keys and values.
+    record class-instance-node {
+        /// Index of this instance's class-type node.
+        class-type: u32,
+        /// Canonical lowercase uuid string.
+        instance-id: string,
+        attrs: list<node-pair>,
+    }
+
+    /// A host module and indexes of its attribute keys and values.
+    record module-node {
+        /// The dotted module name, e.g. `pkg.sub`.
+        name: string,
+        /// Canonical lowercase uuid string.
+        id: string,
+        attrs: list<node-pair>,
+    }
+
+    /// An external function value.
+    record function-node {
+        name: string,
+        docstring: option<string>,
+    }
+
+    /// One node of an arena: a leaf, or a container holding the indexes of
+    /// its children.
+    ///
+    /// Indexes avoid recursive WIT types, which the component model forbids,
+    /// while keeping protobuf bytes entirely inside Rust.
+    variant value-node {
+        ellipsis,
+        not-implemented,
+        none,
+        boolean(bool),
+        integer(s64),
+        bigint(string),
+        float(f64),
+        complex(complex-node),
+        text(string),
+        bytes(list<u8>),
+        list-value(list<u32>),
+        tuple-value(list<u32>),
+        named-tuple(named-tuple-node),
+        dict(list<node-pair>),
+        set(list<u32>),
+        frozen-set(list<u32>),
+        date(date-node),
+        datetime(datetime-node),
+        time(time-node),
+        timedelta(timedelta-node),
+        timezone(timezone-node),
+        exception(exception-value-node),
+        type-name(string),
+        class-type(class-type-node),
+        builtin-function(string),
+        path(string),
+        file-handle(file-handle-node),
+        class-instance(class-instance-node),
+        function(function-node),
+        repr(string),
+        /// An output-only reference back to an enclosing container, as its
+        /// placeholder text (`[...]`, `(...)`, `{...}` or `...`).
+        cycle(string),
+        module(module-node),
+        /// A `decimal.Decimal` as its exact string form, `str(d)`.
+        decimal(string),
+    }
+
+    /// The values of one message: a post-order node arena. Every child
+    /// index is strictly lower than its holder's, so a receiver builds it in
+    /// one forward pass; an index used twice is a shared object. Each
+    /// message names its roots by index.
+    record arena {
+        nodes: list<value-node>,
+    }
+
+    /// A named input supplied to a feed: an index into the feed's arena.
+    record named-value {
+        name: string,
+        value: u32,
+    }
+
+    /// The host enforces suspension and total sleep limits; the sandbox enforces the others.
+    record resource-limits {
+        max-feed-duration-micros: option<u64>,
+        max-turn-duration-micros: option<u64>,
+        max-memory-bytes: option<u64>,
+        gc-interval: option<u64>,
+        max-recursion-depth: option<u64>,
+        max-suspensions: option<u64>,
+        /// Maximum cumulative system sleep duration, enforced by the host.
+        max-total-sleep-micros: option<u64>,
+    }
+
+    /// A frozen clock reading (see `os-policy`).
+    record fixed-datetime {
+        /// Seconds since the Unix epoch, UTC.
+        unix-seconds: s64,
+        /// 0..=999999.
+        microsecond: u32,
+    }
+
+    /// A fixed UTC offset with an optional name.
+    record fixed-time-zone {
+        offset-seconds: s32,
+        name: option<string>,
+    }
+
+    /// The sandbox's local zone; UTC unless set.
+    variant time-zone {
+        /// UTC, the default.
+        utc,
+        /// An IANA zone name (`Europe/London`), resolved from the bundled tz database.
+        named(string),
+        fixed(fixed-time-zone),
+    }
+
+    /// What `date.today()`, `datetime.now()` and `time.time()` read.
+    variant datetime-source {
+        /// The worker's own clock.
+        system,
+        /// Delegate clock calls to the host.
+        call-host,
+        /// One frozen instant.
+        fixed(fixed-datetime),
+    }
+
+    /// What `time.sleep()` and `asyncio.sleep()` do.
+    variant sleep-mode {
+        /// The host waits, capped at this duration in microseconds (default 10s).
+        system(option<u64>),
+        call-host,
+        /// Return at once without waiting.
+        zero,
+    }
+
+    /// A `random.seed()` argument: the types CPython accepts.
+    variant random-seed {
+        /// Two's-complement little-endian bytes, any size.
+        int(list<u8>),
+        /// Must be finite.
+        float(f64),
+        str(string),
+        bytes(list<u8>),
+    }
+
+    /// Where an unseeded `random` generator gets its first state.
+    variant random-start {
+        /// The worker's own OS entropy.
+        system,
+        /// Suspend the first draw with an `os.urandom` call for the host.
+        call-host,
+        /// As `random.seed(seed)` would.
+        seed(random-seed),
+    }
+
+    /// What `time.process_time()` and `time.thread_time()` report.
+    variant process-time {
+        /// Always zero, so elapsed execution time is not observable in the sandbox.
+        zero,
+        /// The session's accumulated execution time.
+        elapsed,
+    }
+
+    /// The session's clock, zone, sleep, process-clock and randomness policies;
+    /// absent fields use the system clock, UTC, host sleeps capped at 10s, OS
+    /// entropy, and a zero process clock.
+    record os-policy {
+        datetime: option<datetime-source>,
+        timezone: option<time-zone>,
+        sleep: option<sleep-mode>,
+        random-start: option<random-start>,
+        process-time: option<process-time>,
+    }
+
+    /// Available renderings for type-check diagnostics.
+    enum type-check-format {
+        full,
+        concise,
+        azure,
+        json,
+        json-lines,
+        rdjson,
+        pylint,
+        gitlab,
+        github,
+    }
+
+    /// Options for creating one REPL session.
+    record configure-request {
+        script-name: string,
+        limits: option<resource-limits>,
+        type-check: bool,
+        type-check-stubs: option<string>,
+        assert-message-annotations: option<u32>,
+        type-check-format: type-check-format,
+        type-check-color: bool,
+        /// How long the child may hold buffered print output. Absent takes its
+        /// default; zero restores line buffering, one event per completed line.
+        print-flush-interval-ms: option<u32>,
+        /// The session's `os-policy`; absent uses every default.
+        os-policy: option<os-policy>,
+    }
+
+    /// One Python snippet and its host inputs.
+    record feed-request {
+        code: string,
+        inputs: list<named-value>,
+        /// The arena every input indexes.
+        values: arena,
+        skip-type-check: bool,
+        /// Absolute virtual working directory to switch the session to; empty
+        /// keeps its current one (`/` until a feed or `os.chdir` changes it).
+        cwd: string,
+    }
+
+    /// A host-raised exception used to resume a call.
+    record raised-error {
+        exc-type: string,
+        message: string,
+    }
+
+    /// The host's answer to an external function or OS call; a returned
+    /// value is an index into the request's arena.
+    variant call-result {
+        return-value(u32),
+        error(raised-error),
+        pending-future(u32),
+        not-found(string),
+        not-handled,
+    }
+
+    /// An answer to the currently suspended function or OS call.
+    record resume-call-request {
+        call-id: u32,
+        outcome: call-result,
+        /// The arena a returned value indexes.
+        values: arena,
+    }
+
+    /// The host's answer to an undefined-name suspension: a value (an index
+    /// into the request's arena), absence (NameError / AttributeError in the
+    /// sandbox), or an exception the host raised while resolving it (raised
+    /// in the sandbox, bypassing hasattr()/getattr() defaults).
+    variant name-lookup-result {
+        value(u32),
+        undefined,
+        error(raised-error),
+    }
+
+    /// An answer to an undefined-name suspension and the arena it indexes.
+    record name-lookup-request {
+        outcome: name-lookup-result,
+        values: arena,
+    }
+
+    /// One settled external future.
+    record future-result {
+        call-id: u32,
+        outcome: call-result,
+    }
+
+    /// Settled external futures and the one arena their values index.
+    record futures-request {
+        results: list<future-result>,
+        values: arena,
+    }
+
+    /// A semantic request to the retained protocol child.
+    variant request {
+        configure(configure-request),
+        feed(feed-request),
+        resume-call(resume-call-request),
+        resume-name-lookup(name-lookup-request),
+        resume-futures(futures-request),
+        /// Raises an error uncatchably at any pending suspension; the session stays usable.
+        abort-feed(raised-error),
+        dump,
+        load(list<u8>),
+        reset,
+    }
+
+    /// One Python traceback frame.
+    record stack-frame {
+        filename: string,
+        line: u32,
+        column: u32,
+        end-line: u32,
+        end-column: u32,
+        frame-name: option<string>,
+        preview-line: option<string>,
+        hide-caret: bool,
+        hide-frame-name: bool,
+    }
+
+    /// Where the expression that suspended execution is in the source: UTF-8
+    /// byte offsets, exclusive end. `filename` names the source as a traceback
+    /// frame does: `<python-input-N>` for the session's N-th feed, or
+    /// `<string>` inside an `eval()` / `exec()` string. An empty filename means
+    /// the child reported no position.
+    record source-range {
+        filename: string,
+        start: u32,
+        end: u32,
+    }
+
+    /// A Python exception raised by the sandbox.
+    record raised-exception {
+        exc-type: string,
+        message: string,
+        traceback: string,
+        frames: list<stack-frame>,
+    }
+
+    /// A buffered print emitted during a turn.
+    record print-event {
+        stderr: bool,
+        text: string,
+    }
+
+    /// A suspended external function call. When `object-id` is set this is a
+    /// method call on a host-backed object — a class instance, or a class
+    /// type (construction of a host class arrives as a `__call__` call).
+    record function-call-event {
+        function-name: string,
+        /// The arena every argument indexes; an object passed twice is one node.
+        values: arena,
+        args: list<u32>,
+        kwargs: list<node-pair>,
+        call-id: u32,
+        /// Uuid string of the routed receiver (instance or class type);
+        /// absent for plain external calls.
+        object-id: option<string>,
+        /// A coroutine may settle before replying with resume-futures.
+        allow-eager-await: bool,
+        /// Where the call expression is in the source.
+        position: source-range,
+    }
+
+    /// A suspended name or lazy-attribute lookup.
+    record name-lookup-event {
+        name: string,
+        /// Set for a lazy attribute lookup on a host-backed object (a class
+        /// instance, or a class type): its uuid string
+        /// (`NameLookup.object_id`).
+        object-id: option<string>,
+        /// Where the name (or attribute access) is in the source.
+        position: source-range,
+    }
+
+    /// Every sandbox task is blocked on external futures.
+    record resolve-futures-event {
+        pending-call-ids: list<u32>,
+        /// Where the main task's blocked `await` is in the source.
+        position: source-range,
+    }
+
+    /// A suspended OS call projected into the public callback shape.
+    record os-call-event {
+        function-name: string,
+        /// The arena every argument indexes.
+        values: arena,
+        args: list<u32>,
+        kwargs: list<node-pair>,
+        call-id: u32,
+        /// As on `function-call-event`: the host may await its wait and answer
+        /// with `resume-futures`. Only ever set on `asyncio.sleep`.
+        allow-eager-await: bool,
+        /// System sleep duration for the host to await directly, in seconds.
+        /// The child caps it; the host must cap it again and charge `max-total-sleep` before waiting.
+        system-sleep-secs: option<f64>,
+        /// Where the call expression is in the source.
+        position: source-range,
+    }
+
+    /// A finished feed's value: an index into its arena.
+    record complete-event {
+        values: arena,
+        value: u32,
+    }
+
+    /// A semantic event emitted by the child.
+    variant event {
+        print(print-event),
+        function-call(function-call-event),
+        os-call(os-call-event),
+        name-lookup(name-lookup-event),
+        resolve-futures(resolve-futures-event),
+        complete(complete-event),
+        error(raised-exception),
+        typing-error(string),
+        dump-result(list<u8>),
+        ok,
+        fatal-error(string),
+        shutdown(option<list<u8>>),
+    }
+
+
+    /// All output produced by one request.
+    record dispatch-result {
+        /// Whether the child remains usable.
+        status: status,
+        /// Buffered prints followed by exactly one turn-ending event.
+        events: list<event>,
+        /// The current session's suspension limit. A host uses this after
+        /// `load`, whose dump replaces the configured session limits.
+        max-suspensions: option<u64>,
+        /// Session sleep limit in microseconds, reported for host enforcement after `load`.
+        max-total-sleep-micros: option<u64>,
+        /// Sandbox execution consumed by the current feed, excluding host suspensions.
+        feed-execution-micros: u64,
+        /// Duration budgets used by the host's hard-kill backstops, including after load.
+        max-feed-duration-micros: option<u64>,
+        max-turn-duration-micros: option<u64>,
+    }
+
+    /// Handles one semantic request using the retained child.
+    dispatch: func(request: request) -> dispatch-result;
+}
+
+/// A component instance containing one stateful Monty worker.
+world monty-runtime {
+    export worker;
+}

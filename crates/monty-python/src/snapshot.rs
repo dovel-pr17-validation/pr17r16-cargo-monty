@@ -1,0 +1,1434 @@
+//! Suspendable `feed_start` execution surface for the subprocess pool.
+//!
+//! `feed_run` drives a snippet to completion, answering every external call
+//! from host callbacks before it returns. `feed_start` instead hands control
+//! back to the caller at each suspension as a *snapshot* object — a
+//! [`PyFunctionSnapshot`] for an external/OS call, a [`PyNameLookupSnapshot`]
+//! for an undefined name, or a [`PyFutureSnapshot`] when every sandbox task is
+//! blocked on external futures — so the caller can inspect the call, snapshot
+//! the worker with [`PyFunctionSnapshot::dump`] (etc.), and resume when ready.
+//! Completion yields a [`MontyComplete`].
+//!
+//! This reinstates the pre-subprocess `feed_start` API shape, mapped onto the
+//! `monty-pool` [`Checkout`] turn primitives. The execution state lives in the
+//! worker, so a snapshot is a *cursor* on a live suspended session rather than
+//! owned, freely-copyable state: only one suspension is live per session, each
+//! snapshot resumes at most once, and `resume` advances that worker forward.
+//!
+//! Every suspension surfaces, OS calls included — `feed_start` never answers
+//! one for you, so a mounted file read comes back as a `FunctionSnapshot` with
+//! `is_os_function` set. The captured `external_lookup=` / `os=`, the
+//! session's `external_modules=` and the feed's mounts are consulted only by
+//! `resume_auto`, which answers a host module's OS call (`import`,
+//! `import_stubs`) from `external_modules=` and offers any other to the mounts
+//! first, falling back to `os=`. Mounts are fixed for the whole feed
+//! (passed to `feed_start`), so `resume` takes no `mount=`. Restoring a
+//! suspended feed with `load_snapshot` re-establishes those mounts — the caller
+//! re-supplies them, as they are never part of the dump.
+
+use std::{
+    convert::Infallible,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
+use monty_pool::{Checkout, OnPrint, PoolError, ResumeValue, TurnEvent};
+use monty_proto::python::{InstanceStore, exc_py_to_monty, monty_to_py, py_to_monty_value, uuid_to_py};
+use monty_types::{CallArgs, ExtFunctionResult, MontyException, MontyObject, MontyUuid, NameLookupResult, SourceRange};
+use pyo3::{
+    Borrowed,
+    exceptions::{PyBaseException, PyRuntimeError, PyTypeError},
+    intern,
+    prelude::*,
+    sync::PyOnceLock,
+    types::{PyBytes, PyDict, PyTuple},
+};
+use pyo3_async_runtimes::tokio::future_into_py;
+use tokio::{sync::Mutex, task::JoinSet};
+
+#[cfg(test)]
+mod tests;
+
+use crate::{
+    async_dispatch::{
+        CoroutineMode, Dispatched, dispatch_coroutine, dispatch_function_call, dispatch_module_call,
+        dispatch_module_coroutine, wait_for_futures,
+    },
+    callback_context::CallbackContext,
+    exceptions::{MontyError, PySourceRange},
+    external::{
+        CallResult, ExternalLookup, HostNames, is_module_call, resolve_object_attr, sync_module_coroutines_error,
+        wire_call_arguments,
+    },
+    pool::{
+        FeedArgs, OsDispatch, SharedCheckout, TurnFuture, block_on_sync, discard_checkout, discard_checkout_sync,
+        dispatch_os_parts, ext_to_resume, pool_err_to_py, run_turn_async, run_turn_sync, turn_fn,
+    },
+    print_target::PrintTarget,
+    telemetry::{capture_otel_context, snapshot_trace_context},
+};
+
+/// Shared context threaded across a `feed_start` drive so each `resume` can
+/// keep dispatching against the same worker, instance store, and print
+/// sink. Cloning bumps the shared handles (the checkout `Arc`, the instance
+/// store dict, the print collector buffer) — every clone drives the **same**
+/// underlying session.
+///
+/// It also carries the `external_lookup=` / `os=` captured at
+/// `feed_start` / `load_snapshot` and a session-persistent pool of pending
+/// coroutine externals: these back [`resume_auto`](PyFunctionSnapshot::resume_auto),
+/// which answers each suspension automatically instead of surfacing it to the
+/// caller. Plain `resume(...)` takes an explicit answer, so these fields only
+/// matter to `resume_auto`.
+pub(crate) struct DriveContext {
+    checkout: SharedCheckout,
+    instances: InstanceStore,
+    print_target: PrintTarget,
+    script_name: String,
+    /// Host OTel context captured at feed/load entry; never serialized with the worker.
+    trace_context: Option<Py<PyAny>>,
+    /// `external_lookup=` captured at `feed_start` / `load_snapshot` and the
+    /// session's `external_modules=`; consulted only by `resume_auto` (plain
+    /// `resume` never looks names up here).
+    names: HostNames,
+    /// `os=` captured at `feed_start` / `load_snapshot`; consulted only by
+    /// `resume_auto`, and only for OS calls this feed's mounts don't cover.
+    os: Option<Py<PyAny>>,
+    /// Pending coroutine externals spawned by async `resume_auto`, keyed by
+    /// `call_id`. `Arc` so every `clone_ref`'d snapshot of one session shares a
+    /// single `JoinSet`; the `tokio` `Mutex` because `wait_for_futures` holds it
+    /// across `.await`. Unused (but harmlessly present) on sync sessions, where
+    /// a coroutine external is a hard error.
+    pending_futures: Arc<Mutex<JoinSet<(u32, ExtFunctionResult)>>>,
+}
+
+impl DriveContext {
+    pub(crate) fn new(
+        checkout: SharedCheckout,
+        instances: InstanceStore,
+        print_target: PrintTarget,
+        script_name: String,
+        names: HostNames,
+        os: Option<Py<PyAny>>,
+        trace_context: Option<Py<PyAny>>,
+    ) -> Self {
+        Self {
+            checkout,
+            instances,
+            print_target,
+            script_name,
+            trace_context,
+            names,
+            os,
+            pending_futures: Arc::new(Mutex::new(JoinSet::new())),
+        }
+    }
+
+    fn clone_ref(&self, py: Python<'_>) -> Self {
+        Self {
+            checkout: SharedCheckout::clone(&self.checkout),
+            instances: self.instances.clone_ref(py),
+            print_target: self.print_target.clone_handle(py),
+            script_name: self.script_name.clone(),
+            trace_context: self.trace_context.as_ref().map(|ctx| ctx.clone_ref(py)),
+            names: self.names.clone_ref(py),
+            os: self.os.as_ref().map(|o| o.clone_ref(py)),
+            pending_futures: Arc::clone(&self.pending_futures),
+        }
+    }
+}
+
+// =============================================================================
+// feed_start entry points (called from the session pymethods)
+// =============================================================================
+
+/// Runs the first feed turn synchronously and returns the resulting snapshot
+/// (or [`MontyComplete`]). `external_lookup` / `os` are stored on the
+/// [`DriveContext`] for later `resume_auto` calls; every suspension the feed
+/// reaches — OS calls included — surfaces as a snapshot.
+pub(crate) fn feed_start_sync(
+    py: Python<'_>,
+    args: FeedArgs,
+    names: HostNames,
+    script_name: String,
+) -> PyResult<Py<PyAny>> {
+    let FeedArgs {
+        code,
+        inputs,
+        mounts,
+        cwd,
+        skip_type_check,
+        os,
+        print_target,
+        checkout,
+        instances,
+        callback_context: _,
+    } = args;
+    let ctx = DriveContext::new(
+        checkout,
+        instances,
+        print_target,
+        script_name,
+        names,
+        os,
+        capture_otel_context(py),
+    );
+    drive_sync(
+        py,
+        ctx,
+        turn_fn(move |c, p| {
+            Box::pin(async move {
+                c.feed_with_cwd(code, inputs, mounts, cwd.as_deref(), skip_type_check, p)
+                    .await
+            })
+        }),
+    )
+}
+
+/// Async counterpart of [`feed_start_sync`]: the returned coroutine runs the
+/// first feed turn off the event loop and resolves to the snapshot (or
+/// [`MontyComplete`]).
+pub(crate) fn feed_start_async(
+    py: Python<'_>,
+    args: FeedArgs,
+    names: HostNames,
+    script_name: String,
+) -> PyResult<Bound<'_, PyAny>> {
+    let FeedArgs {
+        code,
+        inputs,
+        mounts,
+        cwd,
+        skip_type_check,
+        os,
+        print_target,
+        checkout,
+        instances,
+        callback_context: _,
+    } = args;
+    let ctx = DriveContext::new(
+        checkout,
+        instances,
+        print_target,
+        script_name,
+        names,
+        os,
+        capture_otel_context(py),
+    );
+    future_into_py(py, async move {
+        drive_async(
+            ctx,
+            turn_fn(move |c, p| {
+                Box::pin(async move {
+                    c.feed_with_cwd(code, inputs, mounts, cwd.as_deref(), skip_type_check, p)
+                        .await
+                })
+            }),
+        )
+        .await
+    })
+}
+
+// =============================================================================
+// Drive loops: run one turn, then build the snapshot for whatever it reached
+// =============================================================================
+
+/// Runs `initial` (a feed or resume turn) with the GIL released, then builds
+/// the Python object for whatever event it reaches.
+///
+/// Every suspension — OS calls included — surfaces to the caller. Nothing is
+/// answered automatically here; `resume_auto` is where mounts and the captured
+/// `os=` come in.
+fn drive_sync(
+    py: Python<'_>,
+    ctx: DriveContext,
+    initial: impl for<'a> FnOnce(&'a mut Checkout, OnPrint<'a>) -> TurnFuture<'a, TurnEvent> + Send,
+) -> PyResult<Py<PyAny>> {
+    let event = run_turn_sync(py, &ctx.checkout, &ctx.print_target, initial)?;
+    build_snapshot(py, ctx, event, false)
+}
+
+/// Async counterpart of [`drive_sync`]: the worker turn is awaited directly.
+async fn drive_async(
+    ctx: DriveContext,
+    initial: impl for<'a> FnOnce(&'a mut Checkout, OnPrint<'a>) -> TurnFuture<'a, TurnEvent> + Send,
+) -> PyResult<Py<PyAny>> {
+    let event = run_turn_async(&ctx.checkout, &ctx.print_target, initial).await?;
+    Python::attach(|py| build_snapshot(py, ctx, event, true))
+}
+
+/// Answers a suspended OS call from the feed's mounts, returning the next
+/// event when one covered it and `None` when the caller must answer it itself.
+fn try_mounts_sync(py: Python<'_>, ctx: &DriveContext) -> PyResult<Option<TurnEvent>> {
+    run_turn_sync(
+        py,
+        &ctx.checkout,
+        &ctx.print_target,
+        turn_fn(|c, p| Box::pin(c.resume_from_mounts(p))),
+    )
+}
+
+/// Builds the Python object for a caller-visible turn event: a snapshot for a
+/// suspension or [`MontyComplete`] for completion. `is_async` selects the sync
+/// or async snapshot classes (the latter expose awaitable `resume`).
+pub(crate) fn build_snapshot(
+    py: Python<'_>,
+    ctx: DriveContext,
+    event: TurnEvent,
+    is_async: bool,
+) -> PyResult<Py<PyAny>> {
+    match event {
+        TurnEvent::Complete(value) => Py::new(
+            py,
+            MontyComplete {
+                value,
+                instances: ctx.instances,
+            },
+        )
+        .map(Py::into_any),
+        TurnEvent::FunctionCall {
+            function_name,
+            args,
+            call_id,
+            object_id,
+            allow_eager_await,
+            position,
+        } => {
+            let call = FunctionCallData {
+                function_name,
+                args,
+                call_id,
+                is_os_function: false,
+                object_id,
+                allow_eager_await,
+                position,
+            };
+            function_snapshot_py(py, ctx, call, is_async)
+        }
+        TurnEvent::OsCall {
+            function_name,
+            args,
+            call_id,
+            allow_eager_await,
+            position,
+            ..
+        } => {
+            let call = FunctionCallData {
+                function_name,
+                args,
+                call_id,
+                is_os_function: true,
+                object_id: None,
+                allow_eager_await,
+                position,
+            };
+            function_snapshot_py(py, ctx, call, is_async)
+        }
+        TurnEvent::NameLookup {
+            name,
+            object_id,
+            position,
+        } => {
+            let snapshot = SnapshotState::new(ctx);
+            let lookup = NameLookupSnapshot {
+                snapshot,
+                name,
+                object_id,
+                position,
+            };
+            if is_async {
+                Py::new(py, PyAsyncNameLookupSnapshot(lookup)).map(Py::into_any)
+            } else {
+                Py::new(py, PyNameLookupSnapshot(lookup)).map(Py::into_any)
+            }
+        }
+        TurnEvent::ResolveFutures {
+            pending_call_ids,
+            position,
+        } => {
+            let snapshot = SnapshotState::new(ctx);
+            let futures = FutureSnapshot {
+                snapshot,
+                pending_call_ids,
+                position,
+            };
+            if is_async {
+                Py::new(py, PyAsyncFutureSnapshot(futures)).map(Py::into_any)
+            } else {
+                Py::new(py, PyFutureSnapshot(futures)).map(Py::into_any)
+            }
+        }
+    }
+}
+
+fn function_snapshot_py(
+    py: Python<'_>,
+    ctx: DriveContext,
+    call: FunctionCallData,
+    is_async: bool,
+) -> PyResult<Py<PyAny>> {
+    let snapshot = SnapshotState::new(ctx);
+    if is_async {
+        Py::new(py, PyAsyncFunctionSnapshot(FunctionSnapshot::new(snapshot, call))).map(Py::into_any)
+    } else {
+        Py::new(py, PyFunctionSnapshot(FunctionSnapshot::new(snapshot, call))).map(Py::into_any)
+    }
+}
+
+// =============================================================================
+// Shared snapshot state and resume plumbing
+// =============================================================================
+
+/// The live-cursor state every snapshot carries: the drive context plus a
+/// single-use latch enforcing "resume at most once".
+struct SnapshotState {
+    ctx: DriveContext,
+    resumed: AtomicBool,
+}
+
+impl SnapshotState {
+    fn new(ctx: DriveContext) -> Self {
+        Self {
+            ctx,
+            resumed: AtomicBool::new(false),
+        }
+    }
+
+    /// Returns the suspension's OTel context without activating it or consuming the snapshot.
+    fn trace_context(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        if self.resumed.load(Ordering::SeqCst) {
+            return Err(PyRuntimeError::new_err("snapshot has already been resumed"));
+        }
+        let native = {
+            // Never block an event loop on a turn running in another task.
+            let checkout = self
+                .ctx
+                .checkout
+                .try_lock()
+                .map_err(|_| PyRuntimeError::new_err("snapshot session is busy"))?;
+            if self.resumed.load(Ordering::SeqCst) {
+                return Err(PyRuntimeError::new_err("snapshot has already been resumed"));
+            }
+            checkout
+                .as_ref()
+                .ok_or_else(|| PyRuntimeError::new_err("snapshot session is closed"))?
+                .callback_context()
+        };
+        snapshot_trace_context(py, &native, self.ctx.trace_context.as_ref())
+    }
+
+    /// Claims the single resume for this snapshot, returning a fresh
+    /// [`DriveContext`] for the continuation. Errors if already resumed.
+    fn claim(&self, py: Python<'_>) -> PyResult<DriveContext> {
+        self.claim_with(py, |_| Ok(())).map(|(ctx, ())| ctx)
+    }
+
+    fn claim_with<T>(
+        &self,
+        py: Python<'_>,
+        prepare: impl FnOnce(&DriveContext) -> PyResult<T>,
+    ) -> PyResult<(DriveContext, T)> {
+        if self.resumed.load(Ordering::SeqCst) {
+            return Err(PyRuntimeError::new_err("snapshot has already been resumed"));
+        }
+        let mut ctx = self.ctx.clone_ref(py);
+        ctx.print_target.capture_context(py)?;
+        let prepared = prepare(&ctx)?;
+        // Preparation can release Python or re-enter it, so another caller may have claimed meanwhile.
+        if self.resumed.swap(true, Ordering::SeqCst) {
+            Err(PyRuntimeError::new_err("snapshot has already been resumed"))
+        } else {
+            Ok((ctx, prepared))
+        }
+    }
+
+    fn dump(&self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
+        // Check resumed only under the checkout lock
+        let checkout = SharedCheckout::clone(&self.ctx.checkout);
+        let resumed = &self.resumed;
+        let state = py
+            .detach(|| {
+                block_on_sync(async {
+                    let mut guard = checkout.lock().await;
+                    if resumed.load(Ordering::SeqCst) {
+                        return Ok(None);
+                    }
+                    match guard.as_mut() {
+                        Some(checkout) => checkout.dump().await.map(Some),
+                        None => Err(PoolError::Finished),
+                    }
+                })
+            })?
+            .map_err(|e| pool_err_to_py(py, e))?;
+        match state {
+            Some(state) => Ok(PyBytes::new(py, &state).unbind()),
+            None => Err(PyRuntimeError::new_err(
+                "cannot dump a snapshot that has already been resumed",
+            )),
+        }
+    }
+}
+
+/// Maps an `ExtFunctionResult` onto a pool `ResumeValue`, preserving the
+/// `future` answer (which the sandbox uses to register an external future and
+/// keep running other tasks — valid in both sync and async drives).
+fn ext_result_to_resume(result: ExtFunctionResult) -> ResumeValue {
+    match result {
+        ExtFunctionResult::Return(value) => ResumeValue::Return(value),
+        ExtFunctionResult::Error(exc) => ResumeValue::Error(exc),
+        ExtFunctionResult::Future(_) => ResumeValue::Future,
+        ExtFunctionResult::NotFound(name) => {
+            // Preserve the name so the worker raises the right NameError; the
+            // pool fills it from the pending call when resuming.
+            let _ = name;
+            ResumeValue::NotFound
+        }
+    }
+}
+
+/// An optional receiver uuid as a Python `uuid.UUID | None`.
+fn optional_uuid_to_py(py: Python<'_>, uuid: Option<&MontyUuid>) -> PyResult<Option<Py<PyAny>>> {
+    uuid.map(|uuid| uuid_to_py(py, uuid)).transpose()
+}
+
+/// Resolves a name against the [`DriveContext`]'s captured `external_lookup=`,
+/// shared by the sync and async name-lookup `resume_auto`, matching `feed_run`:
+/// `Undefined` makes the sandbox raise `NameError` for a plain name, or
+/// `AttributeError` when `object_id` marks a lazy attribute on a host-backed
+/// object; a host error serving a lazy attribute is raised in the sandbox.
+fn resolve_captured_name(
+    py: Python<'_>,
+    ctx: &DriveContext,
+    name: &str,
+    object_id: Option<MontyUuid>,
+) -> PyResult<NameLookupResult> {
+    if let Some(object_id) = object_id {
+        Ok(resolve_object_attr(py, name, &object_id, &ctx.instances))
+    } else {
+        ExternalLookup::new(py, &ctx.names, &ctx.instances)
+            .resolve_name(name)
+            .map(NameLookupResult::from)
+    }
+}
+
+/// Parses an `ExternalResult` TypedDict — one of `{'return_value': obj}`,
+/// `{'exception': exc}`, `{'exc_type': str, 'message'?: str}`, or
+/// `{'future': ...}` — into a [`ResumeValue`]. `call_id` is unused by the pool
+/// (the worker tracks it) but kept for parity with the documented shape.
+fn parse_external_result(
+    py: Python<'_>,
+    result: &Bound<'_, PyDict>,
+    instances: &InstanceStore,
+) -> PyResult<ResumeValue> {
+    const ARGS_ERROR: &str = "ExternalResult must be a dict with one of: 'return_value', 'exception', 'exc_type' (with optional 'message'), or 'future'";
+
+    if let Some(exc_type_val) = result.get_item(intern!(py, "exc_type"))? {
+        let message_val = result.get_item(intern!(py, "message"))?;
+        let expected_len = if message_val.is_some() { 2 } else { 1 };
+        if result.len() != expected_len {
+            return Err(PyTypeError::new_err(ARGS_ERROR));
+        }
+        let exc_type_str: String = exc_type_val
+            .extract()
+            .map_err(|_| PyTypeError::new_err("'exc_type' must be a string"))?;
+        let exc_type = exc_type_str
+            .parse()
+            .map_err(|_| PyTypeError::new_err(format!("Unknown exception type: '{exc_type_str}'")))?;
+        let message = message_val
+            .map(|m| {
+                m.extract::<String>()
+                    .map_err(|_| PyTypeError::new_err("'message' must be a string"))
+            })
+            .transpose()?;
+        return Ok(ResumeValue::Error(MontyException::new(exc_type, message)));
+    }
+
+    if result.len() != 1 {
+        Err(PyTypeError::new_err(ARGS_ERROR))
+    } else if let Some(rv) = result.get_item(intern!(py, "return_value"))? {
+        let value = py_to_monty_value(&rv, instances).map_err(|e| MontyError::new_err(py, e))?;
+        Ok(ResumeValue::Return(value))
+    } else if let Some(exc) = result.get_item(intern!(py, "exception"))? {
+        if exc.is_instance_of::<PyBaseException>() {
+            let py_err = PyErr::from_value(exc);
+            Ok(ResumeValue::Error(exc_py_to_monty(py, &py_err)))
+        } else {
+            Err(PyTypeError::new_err("'exception' must be a BaseException instance"))
+        }
+    } else if let Some(fut) = result.get_item(intern!(py, "future"))? {
+        if fut.is(py.Ellipsis()) {
+            Ok(ResumeValue::Future)
+        } else {
+            Err(PyTypeError::new_err(
+                "value for the 'future' key must be Ellipsis (...)",
+            ))
+        }
+    } else {
+        Err(PyTypeError::new_err(ARGS_ERROR))
+    }
+}
+
+// =============================================================================
+// FunctionSnapshot (external / OS call) — sync and async
+// =============================================================================
+
+/// The pending-call payload shared by the sync and async function snapshots.
+///
+/// `Clone` so async `resume_auto` can move an owned copy into the `'static`
+/// dispatch future (the snapshot itself is borrowed for only the pymethod call).
+#[derive(Clone)]
+struct FunctionCallData {
+    function_name: String,
+    args: CallArgs,
+    call_id: u32,
+    is_os_function: bool,
+    /// Uuid of the routed receiver — an instance or class type; `None` for
+    /// plain external functions and OS calls.
+    object_id: Option<MontyUuid>,
+    /// The worker accepts a settled coroutine at this suspension.
+    allow_eager_await: bool,
+    /// Where the call expression is in the source.
+    position: SourceRange,
+}
+
+struct FunctionSnapshot {
+    snapshot: SnapshotState,
+    call: FunctionCallData,
+    /// The call's arguments as Python objects, decoded on first read. One
+    /// decode serves `args` and `kwargs`, so `f(x, y=x)` is one object in both.
+    py_arguments: PyOnceLock<(Py<PyTuple>, Py<PyDict>)>,
+}
+
+impl FunctionSnapshot {
+    fn new(snapshot: SnapshotState, call: FunctionCallData) -> Self {
+        Self {
+            snapshot,
+            call,
+            py_arguments: PyOnceLock::new(),
+        }
+    }
+
+    /// The decoded `(args, kwargs)` of the pending call.
+    fn py_arguments(&self, py: Python<'_>) -> PyResult<&(Py<PyTuple>, Py<PyDict>)> {
+        self.py_arguments.get_or_try_init(py, || {
+            let (args, kwargs) = wire_call_arguments(py, &self.call.args, &self.snapshot.ctx.instances)?;
+            Ok((args.unbind(), kwargs.unbind()))
+        })
+    }
+
+    /// The pending call's positional args.
+    fn args<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        Ok(self.py_arguments(py)?.0.bind(py).clone())
+    }
+
+    /// The pending call's keyword args; the same dict on every read.
+    fn kwargs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        Ok(self.py_arguments(py)?.1.bind(py).clone())
+    }
+
+    fn resume_value(&self, py: Python<'_>, result: &Bound<'_, PyDict>) -> PyResult<ResumeValue> {
+        parse_external_result(py, result, &self.snapshot.ctx.instances)
+    }
+
+    /// `ResumeValue::NotHandled` for an OS-call snapshot: the sandbox raises
+    /// the call's own no-handler default.
+    fn not_handled_value(&self) -> PyResult<ResumeValue> {
+        if self.call.is_os_function {
+            Ok(ResumeValue::NotHandled)
+        } else {
+            Err(PyRuntimeError::new_err(
+                "resume_not_handled() is only valid for OS function snapshots",
+            ))
+        }
+    }
+}
+
+/// A paused execution waiting for an external function or OS call result.
+/// Resume with [`Self::resume`] (or [`Self::resume_not_handled`] for OS calls).
+#[pyclass(name = "FunctionSnapshot", module = "pydantic_monty", frozen)]
+pub struct PyFunctionSnapshot(FunctionSnapshot);
+
+#[pymethods]
+impl PyFunctionSnapshot {
+    /// Returns the call's OTel context for manual handlers; requires `opentelemetry-api`.
+    fn trace_context(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.0.snapshot.trace_context(py)
+    }
+
+    /// Whether the worker permits eager coroutine resolution at this suspension.
+    #[getter]
+    fn allow_eager_await(&self) -> bool {
+        self.0.call.allow_eager_await
+    }
+
+    #[getter]
+    fn script_name(&self) -> &str {
+        &self.0.snapshot.ctx.script_name
+    }
+
+    /// Where the suspending expression is in the source.
+    #[getter]
+    fn position(&self) -> PySourceRange {
+        PySourceRange::from(&self.0.call.position)
+    }
+
+    #[getter]
+    fn is_os_function(&self) -> bool {
+        self.0.call.is_os_function
+    }
+
+    #[getter]
+    fn object_id(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        optional_uuid_to_py(py, self.0.call.object_id.as_ref())
+    }
+
+    #[getter]
+    fn function_name(&self) -> &str {
+        &self.0.call.function_name
+    }
+
+    #[getter]
+    fn call_id(&self) -> u32 {
+        self.0.call.call_id
+    }
+
+    #[getter]
+    fn args<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        self.0.args(py)
+    }
+
+    #[getter]
+    fn kwargs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        self.0.kwargs(py)
+    }
+
+    /// Resumes execution with an `ExternalResult` (return value, exception, or
+    /// future), returning the next snapshot or [`MontyComplete`]. Resumes once.
+    fn resume(&self, py: Python<'_>, result: &Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
+        let value = self.0.resume_value(py, result)?;
+        let ctx = self.0.snapshot.claim(py)?;
+        drive_sync(py, ctx, turn_fn(move |c, p| Box::pin(c.resume(value, p))))
+    }
+
+    /// Resumes an OS-call snapshot with monty's default unhandled-OS behaviour.
+    fn resume_not_handled(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let value = self.0.not_handled_value()?;
+        let ctx = self.0.snapshot.claim(py)?;
+        drive_sync(py, ctx, turn_fn(move |c, p| Box::pin(c.resume(value, p))))
+    }
+
+    /// Answers this call automatically, then drives to the next snapshot (or
+    /// [`MontyComplete`]). A host module's OS call (`import`, `import_stubs`)
+    /// is answered from the session's `external_modules=`; any other OS call is
+    /// offered to the feed's mounts first and falls back to the `os=` captured at
+    /// `feed_start` / `load_snapshot`; an external call is resolved through
+    /// `external_lookup=`, and a name absent
+    /// from it resolves to `NotFound` so the sandbox raises `NameError` —
+    /// matching `feed_run`. A coroutine external raises `RuntimeError` (async
+    /// externals need `AsyncMonty`). Consumes the snapshot.
+    fn resume_auto(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let context = CallbackContext::capture(py)?;
+        let (ctx, guard) = self.0.snapshot.claim_with(py, |ctx| {
+            let native = py.detach(|| {
+                block_on_sync(async {
+                    ctx.checkout
+                        .lock()
+                        .await
+                        .as_ref()
+                        .map(Checkout::callback_context)
+                        .unwrap_or_default()
+                })
+            })?;
+            context.enter(py, &native)
+        })?;
+        let call = &self.0.call;
+        // the host's modules answer their own OS calls, ahead of mounts and `os=`
+        let module_call = call.is_os_function && is_module_call(&call.function_name);
+        let value = if call.is_os_function && !module_call {
+            if let Some(event) = try_mounts_sync(py, &ctx)? {
+                return build_snapshot(py, ctx, event, false);
+            }
+            match dispatch_os_parts(
+                py,
+                &call.function_name,
+                &call.args,
+                ctx.os.as_ref(),
+                &ctx.instances,
+                false,
+            ) {
+                OsDispatch::Answer(value) => value,
+                OsDispatch::Coroutine(coro) => {
+                    // As for external functions below: closed rather than leaked.
+                    let _ = coro.bind(py).call_method0(intern!(py, "close"));
+                    discard_checkout_sync(py, &ctx.checkout);
+                    return Err(PyRuntimeError::new_err("async os callbacks require AsyncMonty"));
+                }
+            }
+        } else {
+            let result = if module_call {
+                dispatch_module_call(&call.function_name, &call.args, &ctx.names, &ctx.instances)
+            } else {
+                dispatch_function_call(
+                    &call.function_name,
+                    call.object_id,
+                    &call.args,
+                    &ctx.names,
+                    &ctx.instances,
+                )
+            };
+            match result {
+                CallResult::Sync(result) => ext_result_to_resume(result),
+                CallResult::Coroutine(coro) => {
+                    // Close the un-awaited coroutine so it doesn't leak a
+                    // "coroutine was never awaited" ResourceWarning: a sync
+                    // session has no event loop to drive it.
+                    let _ = coro.bind(py).call_method0(intern!(py, "close"));
+                    discard_checkout_sync(py, &ctx.checkout);
+                    return Err(PyRuntimeError::new_err("async external functions require AsyncMonty"));
+                }
+                // raised at the import, as the sync `feed_run` raises it
+                CallResult::ModuleCoroutine { names, coros, .. } => ext_result_to_resume(ExtFunctionResult::Error(
+                    exc_py_to_monty(py, &sync_module_coroutines_error(py, &names, &coros)),
+                )),
+            }
+        };
+        drop(guard);
+        drive_sync(py, ctx, turn_fn(move |c, p| Box::pin(c.resume(value, p))))
+    }
+
+    fn dump(&self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
+        self.0.snapshot.dump(py)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "FunctionSnapshot(function_name={:?}, is_os_function={})",
+            self.0.call.function_name, self.0.call.is_os_function
+        )
+    }
+}
+
+/// Async sibling of [`PyFunctionSnapshot`]: `resume` / `resume_not_handled`
+/// return awaitables driven off the event loop.
+#[pyclass(name = "AsyncFunctionSnapshot", module = "pydantic_monty", frozen)]
+pub struct PyAsyncFunctionSnapshot(FunctionSnapshot);
+
+#[pymethods]
+impl PyAsyncFunctionSnapshot {
+    /// Returns the call's OTel context for manual handlers; requires `opentelemetry-api`.
+    fn trace_context(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.0.snapshot.trace_context(py)
+    }
+
+    /// Whether `resume_auto` may await a coroutine directly at this suspension.
+    #[getter]
+    fn allow_eager_await(&self) -> bool {
+        self.0.call.allow_eager_await
+    }
+
+    #[getter]
+    fn script_name(&self) -> &str {
+        &self.0.snapshot.ctx.script_name
+    }
+
+    /// Where the suspending expression is in the source.
+    #[getter]
+    fn position(&self) -> PySourceRange {
+        PySourceRange::from(&self.0.call.position)
+    }
+
+    #[getter]
+    fn is_os_function(&self) -> bool {
+        self.0.call.is_os_function
+    }
+
+    #[getter]
+    fn object_id(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        optional_uuid_to_py(py, self.0.call.object_id.as_ref())
+    }
+
+    #[getter]
+    fn function_name(&self) -> &str {
+        &self.0.call.function_name
+    }
+
+    #[getter]
+    fn call_id(&self) -> u32 {
+        self.0.call.call_id
+    }
+
+    #[getter]
+    fn args<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        self.0.args(py)
+    }
+
+    #[getter]
+    fn kwargs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        self.0.kwargs(py)
+    }
+
+    fn resume<'py>(&self, py: Python<'py>, result: &Bound<'_, PyDict>) -> PyResult<Bound<'py, PyAny>> {
+        let value = self.0.resume_value(py, result)?;
+        let ctx = self.0.snapshot.claim(py)?;
+        future_into_py(py, async move {
+            drive_async(ctx, turn_fn(move |c, p| Box::pin(c.resume(value, p)))).await
+        })
+    }
+
+    fn resume_not_handled<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let value = self.0.not_handled_value()?;
+        let ctx = self.0.snapshot.claim(py)?;
+        future_into_py(py, async move {
+            drive_async(ctx, turn_fn(move |c, p| Box::pin(c.resume(value, p)))).await
+        })
+    }
+
+    /// Awaits eligible coroutine calls directly; other coroutines are spawned
+    /// for later resolution by [`PyAsyncFutureSnapshot::resume_auto`].
+    fn resume_auto<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let context = CallbackContext::capture(py)?;
+        let ctx = self.0.snapshot.claim(py)?;
+        // owned copy: the snapshot is borrowed only for this synchronous prologue
+        let call = self.0.call.clone();
+        future_into_py(py, async move {
+            let native = ctx
+                .checkout
+                .lock()
+                .await
+                .as_ref()
+                .map(Checkout::callback_context)
+                .unwrap_or_default();
+            let mut eager = false;
+            // Dispatch inside the future: a coroutine's `into_future` needs the
+            // asyncio task-locals that `future_into_py`'s scope establishes.
+            // Dispatch (and convert any coroutine) under the callback context;
+            // only a handed-back await runs outside it.
+            // the host's modules answer their own OS calls, ahead of mounts and `os=`
+            let module_call = call.is_os_function && is_module_call(&call.function_name);
+            let dispatched = if call.is_os_function && !module_call {
+                // mounts get first refusal, then the captured `os=`
+                let mounted = run_turn_async(
+                    &ctx.checkout,
+                    &ctx.print_target,
+                    turn_fn(|c, p| Box::pin(c.resume_from_mounts(p))),
+                )
+                .await?;
+                if let Some(event) = mounted {
+                    return Python::attach(|py| build_snapshot(py, ctx, event, true));
+                }
+                let mut join_set = ctx.pending_futures.lock().await;
+                Python::attach(|py| {
+                    let _guard = context.enter(py, &native)?;
+                    match dispatch_os_parts(
+                        py,
+                        &call.function_name,
+                        &call.args,
+                        ctx.os.as_ref(),
+                        &ctx.instances,
+                        true,
+                    ) {
+                        OsDispatch::Answer(value) => Ok(Dispatched::Done(value)),
+                        OsDispatch::Coroutine(coro) => {
+                            let mode = CoroutineMode::for_os_call(&call.function_name, call.allow_eager_await);
+                            dispatch_coroutine(coro, call.call_id, mode, &mut join_set, &ctx.instances)
+                        }
+                    }
+                })
+            } else {
+                let mut join_set = ctx.pending_futures.lock().await;
+                Python::attach(|py| {
+                    let _guard = context.enter(py, &native)?;
+                    let result = if module_call {
+                        dispatch_module_call(&call.function_name, &call.args, &ctx.names, &ctx.instances)
+                    } else {
+                        dispatch_function_call(
+                            &call.function_name,
+                            call.object_id,
+                            &call.args,
+                            &ctx.names,
+                            &ctx.instances,
+                        )
+                    };
+                    match result {
+                        CallResult::Sync(result) => Ok(Dispatched::Done(ext_result_to_resume(result))),
+                        CallResult::Coroutine(coro) => {
+                            let mode = CoroutineMode::for_function_call(call.allow_eager_await);
+                            dispatch_coroutine(coro, call.call_id, mode, &mut join_set, &ctx.instances)
+                        }
+                        CallResult::ModuleCoroutine { names, coros, then } => {
+                            dispatch_module_coroutine(names, coros, then)
+                        }
+                    }
+                })
+            };
+            // a module factory settles outside the callback context; the answer
+            // it unblocks is made back inside it
+            let dispatched = match dispatched {
+                Ok(Dispatched::Module(pending)) => {
+                    let settled = pending.settle().await;
+                    let mut join_set = ctx.pending_futures.lock().await;
+                    Python::attach(|py| {
+                        let _guard = context.enter(py, &native)?;
+                        let mode = CoroutineMode::for_function_call(call.allow_eager_await);
+                        settled.dispatch(py, call.call_id, mode, &mut join_set, &ctx.names, &ctx.instances)
+                    })
+                }
+                other => other,
+            };
+            let answer = match dispatched {
+                Ok(Dispatched::Done(value)) => Ok(value),
+                Ok(Dispatched::Module(_)) => unreachable!("a pending module is settled above"),
+                Ok(Dispatched::Eager(future)) => {
+                    eager = true;
+                    Ok(ext_result_to_resume(future.await))
+                }
+                Ok(Dispatched::AsValue(future)) => Ok(ext_result_to_resume(future.await)),
+                Err(err) => Err(err),
+            };
+            let value = match answer {
+                Ok(value) => value,
+                Err(err) => {
+                    discard_checkout(&ctx.checkout).await;
+                    return Err(err);
+                }
+            };
+            drive_async(
+                ctx,
+                turn_fn(move |c, p| {
+                    Box::pin(async move {
+                        if eager {
+                            c.resume_futures(vec![(call.call_id, value)], p).await
+                        } else {
+                            c.resume(value, p).await
+                        }
+                    })
+                }),
+            )
+            .await
+        })
+    }
+
+    fn dump(&self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
+        self.0.snapshot.dump(py)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "AsyncFunctionSnapshot(function_name={:?}, is_os_function={})",
+            self.0.call.function_name, self.0.call.is_os_function
+        )
+    }
+}
+
+// =============================================================================
+// NameLookupSnapshot — sync and async
+// =============================================================================
+
+struct NameLookupSnapshot {
+    snapshot: SnapshotState,
+    name: String,
+    /// Id of the receiver for a lazy attribute lookup on a host-backed
+    /// object (instance or class type); `None` for a plain undefined-name
+    /// lookup.
+    object_id: Option<MontyUuid>,
+    /// Where the name (or attribute access) is in the source.
+    position: SourceRange,
+}
+
+/// The argument to `NameLookupSnapshot.resume`, distinguishing an omitted value
+/// (`Unset` — raise `NameError`) from an explicitly supplied one (`Set`,
+/// including `None`).
+///
+/// A bare `Option<Bound<PyAny>>` cannot express this: PyO3 extracts Python
+/// `None` to Rust `None`, collapsing an explicit `None` binding into the
+/// "omitted" case. Capturing the object here keeps `None` a real value, while
+/// the unit `Unset` default — which needs no `py` token, unlike any Python
+/// object — marks omission.
+enum MaybeValue<'py> {
+    Unset,
+    Set(Bound<'py, PyAny>),
+}
+
+impl<'a, 'py> FromPyObject<'a, 'py> for MaybeValue<'py> {
+    type Error = Infallible;
+
+    fn extract(obj: Borrowed<'a, 'py, PyAny>) -> Result<Self, Self::Error> {
+        Ok(MaybeValue::Set(obj.to_owned()))
+    }
+}
+
+impl NameLookupSnapshot {
+    /// Converts the `resume` argument into the name's binding: an omitted value
+    /// (`Unset`) leaves the lookup unanswered — the sandbox raises `NameError`
+    /// for a plain name, or `AttributeError` when `object_id` marks a lazy host
+    /// attribute — while a supplied value (**including `None`**) binds it.
+    fn resume_value(&self, py: Python<'_>, value: MaybeValue<'_>) -> PyResult<Option<MontyObject>> {
+        match value {
+            MaybeValue::Unset => Ok(None),
+            MaybeValue::Set(value) => py_to_monty_value(&value, &self.snapshot.ctx.instances)
+                .map(Some)
+                .map_err(|e| MontyError::new_err(py, e)),
+        }
+    }
+}
+
+/// A paused execution waiting for the value of an undefined name (or, when
+/// `object_id` is set, a lazy host attribute). Resume with a `value` to define
+/// it, or with nothing to let the sandbox raise `NameError` (`AttributeError`
+/// for a host attribute).
+#[pyclass(name = "NameLookupSnapshot", module = "pydantic_monty", frozen)]
+pub struct PyNameLookupSnapshot(NameLookupSnapshot);
+
+#[pymethods]
+impl PyNameLookupSnapshot {
+    /// Returns the lookup's OTel context for manual handlers; requires `opentelemetry-api`.
+    fn trace_context(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.0.snapshot.trace_context(py)
+    }
+
+    #[getter]
+    fn script_name(&self) -> &str {
+        &self.0.snapshot.ctx.script_name
+    }
+
+    /// Where the suspending expression is in the source.
+    #[getter]
+    fn position(&self) -> PySourceRange {
+        PySourceRange::from(&self.0.position)
+    }
+
+    #[getter]
+    fn variable_name(&self) -> &str {
+        &self.0.name
+    }
+
+    /// Id of the receiver for a lazy attribute lookup; `None` for a plain
+    /// undefined-name lookup.
+    #[getter]
+    fn object_id(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        optional_uuid_to_py(py, self.0.object_id.as_ref())
+    }
+
+    #[pyo3(signature = (*, value=MaybeValue::Unset))]
+    fn resume(&self, py: Python<'_>, value: MaybeValue<'_>) -> PyResult<Py<PyAny>> {
+        let value = self.0.resume_value(py, value)?;
+        let ctx = self.0.snapshot.claim(py)?;
+        drive_sync(py, ctx, turn_fn(move |c, p| Box::pin(c.resume_name_lookup(value, p))))
+    }
+
+    /// Answers this name lookup automatically from the captured
+    /// `external_lookup=`, then drives to the next snapshot. A name absent from
+    /// the lookup leaves it undefined, so the sandbox raises `NameError`; a
+    /// host error serving a lazy attribute is raised in the sandbox instead.
+    /// Consumes the snapshot.
+    fn resume_auto(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let context = CallbackContext::capture(py)?;
+        let (ctx, guard) = self.0.snapshot.claim_with(py, |ctx| {
+            let native = py.detach(|| {
+                block_on_sync(async {
+                    ctx.checkout
+                        .lock()
+                        .await
+                        .as_ref()
+                        .map(Checkout::callback_context)
+                        .unwrap_or_default()
+                })
+            })?;
+            context.enter(py, &native)
+        })?;
+        let value = match resolve_captured_name(py, &ctx, &self.0.name, self.0.object_id) {
+            Ok(value) => value,
+            Err(err) => {
+                discard_checkout_sync(py, &ctx.checkout);
+                return Err(err);
+            }
+        };
+        drop(guard);
+        drive_sync(py, ctx, turn_fn(move |c, p| Box::pin(c.resume_name_lookup(value, p))))
+    }
+
+    fn dump(&self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
+        self.0.snapshot.dump(py)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("NameLookupSnapshot(variable_name={:?})", self.0.name)
+    }
+}
+
+/// Async sibling of [`PyNameLookupSnapshot`].
+#[pyclass(name = "AsyncNameLookupSnapshot", module = "pydantic_monty", frozen)]
+pub struct PyAsyncNameLookupSnapshot(NameLookupSnapshot);
+
+#[pymethods]
+impl PyAsyncNameLookupSnapshot {
+    /// Returns the lookup's OTel context for manual handlers; requires `opentelemetry-api`.
+    fn trace_context(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.0.snapshot.trace_context(py)
+    }
+
+    #[getter]
+    fn script_name(&self) -> &str {
+        &self.0.snapshot.ctx.script_name
+    }
+
+    /// Where the suspending expression is in the source.
+    #[getter]
+    fn position(&self) -> PySourceRange {
+        PySourceRange::from(&self.0.position)
+    }
+
+    #[getter]
+    fn variable_name(&self) -> &str {
+        &self.0.name
+    }
+
+    /// Id of the receiver for a lazy attribute lookup; `None` for a plain
+    /// undefined-name lookup.
+    #[getter]
+    fn object_id(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        optional_uuid_to_py(py, self.0.object_id.as_ref())
+    }
+
+    #[pyo3(signature = (*, value=MaybeValue::Unset))]
+    fn resume<'py>(&self, py: Python<'py>, value: MaybeValue<'_>) -> PyResult<Bound<'py, PyAny>> {
+        let value = self.0.resume_value(py, value)?;
+        let ctx = self.0.snapshot.claim(py)?;
+        future_into_py(py, async move {
+            drive_async(ctx, turn_fn(move |c, p| Box::pin(c.resume_name_lookup(value, p)))).await
+        })
+    }
+
+    /// Async sibling of [`PyNameLookupSnapshot::resume_auto`].
+    fn resume_auto<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let context = CallbackContext::capture(py)?;
+        let ctx = self.0.snapshot.claim(py)?;
+        let name = self.0.name.clone();
+        let object_id = self.0.object_id;
+        future_into_py(py, async move {
+            let native = ctx
+                .checkout
+                .lock()
+                .await
+                .as_ref()
+                .map(Checkout::callback_context)
+                .unwrap_or_default();
+            let value = match Python::attach(|py| {
+                let _guard = context.enter(py, &native)?;
+                resolve_captured_name(py, &ctx, &name, object_id)
+            }) {
+                Ok(value) => value,
+                Err(err) => {
+                    discard_checkout(&ctx.checkout).await;
+                    return Err(err);
+                }
+            };
+            drive_async(ctx, turn_fn(move |c, p| Box::pin(c.resume_name_lookup(value, p)))).await
+        })
+    }
+
+    fn dump(&self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
+        self.0.snapshot.dump(py)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("AsyncNameLookupSnapshot(variable_name={:?})", self.0.name)
+    }
+}
+
+// =============================================================================
+// FutureSnapshot — sync and async
+// =============================================================================
+
+struct FutureSnapshot {
+    snapshot: SnapshotState,
+    pending_call_ids: Vec<u32>,
+    /// Where the main task's blocked `await` is in the source.
+    position: SourceRange,
+}
+
+impl FutureSnapshot {
+    /// Parses the `{call_id: result}` mapping into `ResumeValue`s, rejecting a
+    /// pending `future` answer up front: a future must settle to a return value
+    /// or exception, not to another future. Validating here — before `resume`
+    /// calls `claim()` — means an invalid resolution fails with a `PyTypeError`
+    /// without consuming the (single-use) snapshot or stranding the worker.
+    fn resume_values(&self, py: Python<'_>, results: &Bound<'_, PyDict>) -> PyResult<Vec<(u32, ResumeValue)>> {
+        let mut resolved = Vec::with_capacity(results.len());
+        for (key, value) in results {
+            let call_id: u32 = key
+                .extract()
+                .map_err(|_| PyTypeError::new_err("future result keys must be int call ids"))?;
+            let dict = value
+                .cast_into::<PyDict>()
+                .map_err(|_| PyTypeError::new_err("future result values must be ExternalResult dicts"))?;
+            let resume = parse_external_result(py, &dict, &self.snapshot.ctx.instances)?;
+            if matches!(resume, ResumeValue::Future) {
+                return Err(PyTypeError::new_err(format!(
+                    "future {call_id} cannot resolve to another future; provide a return value or exception"
+                )));
+            }
+            resolved.push((call_id, resume));
+        }
+        Ok(resolved)
+    }
+}
+
+/// A paused execution where every sandbox task is blocked on external futures.
+/// Resume with a `{call_id: ExternalResult}` mapping for one or more futures.
+#[pyclass(name = "FutureSnapshot", module = "pydantic_monty", frozen)]
+pub struct PyFutureSnapshot(FutureSnapshot);
+
+#[pymethods]
+impl PyFutureSnapshot {
+    /// Returns the future-resolution OTel context for manual handlers; requires `opentelemetry-api`.
+    fn trace_context(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.0.snapshot.trace_context(py)
+    }
+
+    #[getter]
+    fn script_name(&self) -> &str {
+        &self.0.snapshot.ctx.script_name
+    }
+
+    /// Where the suspending expression is in the source.
+    #[getter]
+    fn position(&self) -> PySourceRange {
+        PySourceRange::from(&self.0.position)
+    }
+
+    #[getter]
+    fn pending_call_ids(&self) -> Vec<u32> {
+        self.0.pending_call_ids.clone()
+    }
+
+    fn resume(&self, py: Python<'_>, results: &Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
+        let resolved = self.0.resume_values(py, results)?;
+        let ctx = self.0.snapshot.claim(py)?;
+        drive_sync(py, ctx, turn_fn(move |c, p| Box::pin(c.resume_futures(resolved, p))))
+    }
+
+    /// Sync sessions have no event loop to drive coroutine externals, so this
+    /// always raises; resolve the pending futures manually with
+    /// `resume({call_id: ...})`. Does not consume the snapshot (no side effects).
+    #[expect(clippy::unused_self, reason = "a pyclass instance method must take &self")]
+    fn resume_auto(&self) -> PyResult<Py<PyAny>> {
+        Err(PyRuntimeError::new_err("async external functions require AsyncMonty"))
+    }
+
+    fn dump(&self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
+        self.0.snapshot.dump(py)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("FutureSnapshot(pending_call_ids={:?})", self.0.pending_call_ids)
+    }
+}
+
+/// Async sibling of [`PyFutureSnapshot`].
+#[pyclass(name = "AsyncFutureSnapshot", module = "pydantic_monty", frozen)]
+pub struct PyAsyncFutureSnapshot(FutureSnapshot);
+
+#[pymethods]
+impl PyAsyncFutureSnapshot {
+    /// Returns the future-resolution OTel context for manual handlers; requires `opentelemetry-api`.
+    fn trace_context(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.0.snapshot.trace_context(py)
+    }
+
+    #[getter]
+    fn script_name(&self) -> &str {
+        &self.0.snapshot.ctx.script_name
+    }
+
+    /// Where the suspending expression is in the source.
+    #[getter]
+    fn position(&self) -> PySourceRange {
+        PySourceRange::from(&self.0.position)
+    }
+
+    #[getter]
+    fn pending_call_ids(&self) -> Vec<u32> {
+        self.0.pending_call_ids.clone()
+    }
+
+    fn resume<'py>(&self, py: Python<'py>, results: &Bound<'_, PyDict>) -> PyResult<Bound<'py, PyAny>> {
+        let resolved = self.0.resume_values(py, results)?;
+        let ctx = self.0.snapshot.claim(py)?;
+        future_into_py(py, async move {
+            drive_async(ctx, turn_fn(move |c, p| Box::pin(c.resume_futures(resolved, p)))).await
+        })
+    }
+
+    /// Waits for one or more of the coroutine externals spawned by earlier
+    /// `resume_auto` calls to settle, delivers them, and drives to the next
+    /// snapshot. Raises if there are no pending coroutines to await — e.g. on a
+    /// snapshot restored via `load_snapshot`, whose spawned coroutines lived in
+    /// the previous process — without consuming it; resolve those manually.
+    fn resume_auto<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let (ctx, mut join_set) = self.0.snapshot.claim_with(py, |ctx| {
+            let join_set = Arc::clone(&ctx.pending_futures)
+                .try_lock_owned()
+                .map_err(|_| PyRuntimeError::new_err("snapshot session is busy"))?;
+            if join_set.is_empty() {
+                Err(PyRuntimeError::new_err(
+                    "No pending async tasks but ResolveFutures requested",
+                ))
+            } else {
+                Ok(join_set)
+            }
+        })?;
+        future_into_py(py, async move {
+            let resolved = wait_for_futures(&mut join_set).await.and_then(|results| {
+                results
+                    .into_iter()
+                    .map(|(call_id, result)| Ok((call_id, ext_to_resume(result)?)))
+                    .collect::<PyResult<Vec<_>>>()
+            });
+            drop(join_set);
+            let results = match resolved {
+                Ok(results) => results,
+                Err(err) => {
+                    discard_checkout(&ctx.checkout).await;
+                    return Err(err);
+                }
+            };
+            drive_async(ctx, turn_fn(move |c, p| Box::pin(c.resume_futures(results, p)))).await
+        })
+    }
+
+    fn dump(&self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
+        self.0.snapshot.dump(py)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("AsyncFutureSnapshot(pending_call_ids={:?})", self.0.pending_call_ids)
+    }
+}
+
+// =============================================================================
+// MontyComplete — terminal value (shared by sync and async)
+// =============================================================================
+
+/// The result of a completed `feed_start` execution. `output` converts the
+/// final value from monty's representation to a Python object on each access.
+#[pyclass(name = "MontyComplete", module = "pydantic_monty", frozen)]
+pub struct MontyComplete {
+    value: MontyObject,
+    instances: InstanceStore,
+}
+
+#[pymethods]
+impl MontyComplete {
+    #[getter]
+    fn output(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        monty_to_py(py, &self.value, &self.instances)
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let output = self.output(py)?;
+        Ok(format!("MontyComplete(output={})", output.bind(py).repr()?))
+    }
+}

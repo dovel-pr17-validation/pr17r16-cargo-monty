@@ -1,0 +1,220 @@
+// Hand-written typings for the turn objects produced by the native
+// `NativeSession` methods (src/pool.rs). The napi-generated native-addon d.ts
+// types each turn as a plain `object`; these interfaces are the contract the
+// Rust side upholds — every turn-producing method resolves to exactly one of
+// the `NativeTurn` variants below.
+
+/** One frame of a Python traceback, as shipped by the native binding. */
+export interface NativeFrame {
+  filename: string
+  line: number
+  column: number
+  endLine: number
+  endColumn: number
+  frameName?: string
+  previewLine?: string
+  hideCaret: boolean
+  hideFrameName: boolean
+}
+
+/** Where the expression that suspended execution is in the source; the
+ *  `SourceRange` of `errors.ts`, as the native binding ships it. */
+export interface NativeSourceRange {
+  filename: string
+  start: number
+  end: number
+}
+
+/** A sandbox exception: type name, message, the worker-rendered Python
+ *  traceback string, and the structured frames behind it. */
+export interface NativeException {
+  excType: string
+  message: string
+  /** Full Python traceback, rendered by the worker (monty's `MontyException`
+   *  Display). Used verbatim; never re-rendered in TypeScript. */
+  traceback: string
+  frames: NativeFrame[]
+}
+
+/** The fed snippet completed with this (already converted) value. */
+export interface CompleteTurn {
+  kind: 'complete'
+  value: unknown
+}
+
+interface CallbackTurn {
+  /** Host-generated native span identity, resolved by the telemetry bridge. */
+  callbackSpanKey?: string
+  /** Where the suspending expression is in the source. */
+  position: NativeSourceRange
+}
+
+/** The sandbox called an external function — answer with a `resume*` call. */
+export interface FunctionCallTurn extends CallbackTurn {
+  kind: 'functionCall'
+  functionName: string
+  /** Positional arguments, already converted to JS values. */
+  args: unknown[]
+  /**
+   * Keyword arguments as `[key, value]` pairs. Keys are values (usually
+   * strings), never object properties — build records with a null prototype.
+   */
+  kwargs: [unknown, unknown][]
+  callId: number
+  /** Set for host-routed calls: the uuid of the receiver in the session's
+   *  `InstanceStore` — a class instance, or a class type (a classmethod, or
+   *  `__call__` construction). The receiver is NOT in `args`; null/absent
+   *  for plain external calls. */
+  objectId?: string | null
+  /** A coroutine may settle before replying with `resolveFutures`. */
+  allowEagerAwait?: boolean
+}
+
+/** The sandbox performed an OS operation no mount handled. */
+export interface OsCallTurn extends CallbackTurn {
+  kind: 'osCall'
+  functionName: string
+  args: unknown[]
+  kwargs: [unknown, unknown][]
+  callId: number
+  /** As on `FunctionCallTurn`: the wait may settle before replying with `resolveFutures`. Only set on async sleeps. */
+  allowEagerAwait?: boolean
+  /**
+   * Seconds for a pool-managed sleep, already capped and charged to `maxTotalSleepSecs`.
+   * Absent for calls delegated to `os`.
+   */
+  systemSleepSecs?: number
+}
+
+/**
+ * Async sleeps accept `resumeFuture` in both system and host modes.
+ * Mirrors `OsFunctionCall::accepts_future` in `monty-types`.
+ */
+export function osCallAcceptsFuture(functionName: string): boolean {
+  return functionName === 'asyncio.sleep' || functionName === 'system.async_sleep'
+}
+
+/** The sandbox read an undefined name — answer with `resumeNameLookup`. */
+export interface NameLookupTurn extends CallbackTurn {
+  kind: 'nameLookup'
+  name: string
+  /** Set for lazy attribute lookups on a host-backed object (a class
+   *  instance, or a class type): the receiver's uuid. Answering
+   *  `resumeNameLookup(null, null, ...)` then makes the sandbox raise
+   *  `AttributeError` (not `NameError`). */
+  objectId?: string | null
+}
+
+/** Every sandbox task is blocked on external futures. */
+export interface ResolveFuturesTurn extends CallbackTurn {
+  kind: 'resolveFutures'
+  pendingCallIds: number[]
+}
+
+/** The sandbox raised; the worker and session stay usable. */
+export interface ErrorTurn {
+  kind: 'error'
+  exception: NativeException
+}
+
+/** Type checking rejected the snippet; the worker and session stay usable. */
+export interface TypingErrorTurn {
+  kind: 'typingError'
+  diagnostics: string
+}
+
+/** The worker died (crash or watchdog kill); the session is lost. */
+export interface CrashedTurn {
+  kind: 'crashed'
+  message: string
+  timedOut: boolean
+  exitStatus?: string
+}
+
+/** The worker (or caller) violated the protocol; the session is lost. */
+export interface ProtocolTurn {
+  kind: 'protocol'
+  message: string
+}
+
+/** A remote worker's connection closed mid-session; the session is lost.
+ *  WebSocket pools only. */
+export interface DisconnectedTurn {
+  kind: 'disconnected'
+  message: string
+}
+
+/** A draining server declined the request, which did not run; the session is
+ *  lost. `dump` restores it on a fresh session, when the server stored it.
+ *  WebSocket pools only. */
+export interface ShutdownTurn {
+  kind: 'shutdown'
+  message: string
+  dump?: Uint8Array
+}
+
+/** A restore of an idle (between-feeds) dump — no suspension to resume. Only
+ *  produced by `NativeSession.restore`, surfaced by `MontySession.loadSession`. */
+export interface LoadedTurn {
+  kind: 'loaded'
+}
+
+/** A non-feed request succeeded with no value or suspension. Only produced by
+ *  `NativeSession.installDependencies` and `NativeSession.enter`. */
+export interface OkTurn {
+  kind: 'ok'
+}
+
+/** No worker became available within the checkout timeout. Only produced by
+ *  `NativeSession.enter`. */
+export interface ExhaustedTurn {
+  kind: 'exhausted'
+  message: string
+}
+
+/** What `NativeSession.enter` resolves to: entered, or why not. */
+export type EnterTurn =
+  | OkTurn
+  | ExhaustedTurn
+  | ErrorTurn
+  | TypingErrorTurn
+  | CrashedTurn
+  | ProtocolTurn
+  | DisconnectedTurn
+  | ShutdownTurn
+
+/** The session's dump, or a storing server's record ID. Only produced by
+ *  `NativeSession.dump`. */
+export interface DumpedTurn {
+  kind: 'dumped'
+  state: Uint8Array
+}
+
+/** No mount covered the pending OS call, which stays suspended for the caller
+ *  to answer. Only produced by `NativeSession.resumeFromMounts`. */
+export interface NotMountedTurn {
+  kind: 'notMounted'
+}
+
+/** Everything one protocol turn can resolve to. */
+export type NativeTurn =
+  | CompleteTurn
+  | FunctionCallTurn
+  | OsCallTurn
+  | NameLookupTurn
+  | ResolveFuturesTurn
+  | ErrorTurn
+  | TypingErrorTurn
+  | CrashedTurn
+  | ProtocolTurn
+  | DisconnectedTurn
+  | ShutdownTurn
+
+/** One settled promise outcome delivered to `resolveFutures`. */
+export interface NativeFutureResult {
+  callId: number
+  ok: boolean
+  value?: unknown
+  excType?: string
+  message?: string
+}

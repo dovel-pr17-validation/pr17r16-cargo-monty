@@ -1,0 +1,183 @@
+// every test here drives the standalone CLI, which a worker-only build refuses
+#![cfg(feature = "standalone")]
+
+use std::{fs, process::Command, time::Instant};
+
+use tempfile::TempDir;
+
+/// Runs the CLI binary and returns trimmed, ANSI-free stderr for exact assertions.
+fn run_monty(args: &[&str]) -> (bool, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_monty"))
+        .args(args)
+        .output()
+        .expect("monty CLI should run");
+
+    (
+        output.status.success(),
+        strip_ansi(&String::from_utf8(output.stderr).expect("stderr should be valid UTF-8"))
+            .trim()
+            .to_owned(),
+    )
+}
+
+/// Removes ANSI escape sequences so tests can assert on the actual error text.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+
+        if chars.next_if_eq(&'[').is_none() {
+            continue;
+        }
+
+        for next in chars.by_ref() {
+            if next.is_ascii_alphabetic() {
+                break;
+            }
+        }
+    }
+
+    out
+}
+
+/// Writes `code` to a temporary Python file and returns the containing temp dir.
+fn script_dir(code: &str) -> TempDir {
+    let dir = TempDir::new().expect("tempdir should be created");
+    fs::write(dir.path().join("script.py"), code).expect("script should be written");
+    dir
+}
+
+#[test]
+fn unmounted_paths_report_permission_error() {
+    let host_dir = TempDir::new().expect("tempdir should be created");
+    let script_dir = script_dir("from pathlib import Path\nPath('/outside.txt').read_text()\n");
+    let mount = format!("{}::/mnt", host_dir.path().display());
+    let script = script_dir.path().join("script.py");
+
+    let (success, stderr) = run_monty(&["-m", &mount, script.to_str().expect("utf-8 path")]);
+
+    assert!(!success, "CLI should fail for unmounted filesystem access");
+    assert!(
+        stderr.contains("PermissionError: Permission denied: '/outside.txt'"),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+/// `--max-sleep` cuts a long sleep short; the default cap is ten seconds, so
+/// an hour-long sleep with a tiny cap returns at once.
+#[test]
+fn max_sleep_caps_a_long_sleep() {
+    let host_dir = TempDir::new().expect("tempdir should be created");
+    let script_dir = script_dir("import time\ntime.sleep(3600)\nprint('woke')\n");
+    let mount = format!("{}::/mnt", host_dir.path().display());
+    let script = script_dir.path().join("script.py");
+
+    let start = Instant::now();
+    let (success, stderr) = run_monty(&[
+        "-m",
+        &mount,
+        "--max-sleep",
+        "0.001",
+        script.to_str().expect("utf-8 path"),
+    ]);
+
+    assert!(success, "unexpected stderr: {stderr}");
+    // well under the 10s default, so an ignored `--max-sleep` fails too
+    assert!(start.elapsed().as_secs() < 5, "the sleep was not capped");
+}
+
+/// A sleep exceeding `--max-total-sleep` raises an uncatchable `TimeoutError` before waiting.
+#[test]
+fn max_total_sleep_refuses_a_sleep_over_budget() {
+    // exact binary fractions, so the reported total is exact too
+    let script_dir =
+        script_dir("import time\ntime.sleep(0.125)\ntry:\n    time.sleep(5)\nexcept TimeoutError:\n    pass\n");
+    let script = script_dir.path().join("script.py");
+
+    let start = Instant::now();
+    let (success, stderr) = run_monty(&["--max-total-sleep", "0.25", script.to_str().expect("utf-8 path")]);
+
+    assert!(!success, "the sleep over budget should fail the run: {stderr}");
+    assert!(
+        stderr.contains("TimeoutError: sleep limit exceeded: 5.125s > 250ms"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(start.elapsed().as_secs() < 5, "the sleep was not refused");
+}
+
+#[test]
+fn max_sleep_applies_without_a_mount() {
+    let script_dir = script_dir("import time\ntime.sleep(3600)\nprint('woke')\n");
+    let script = script_dir.path().join("script.py");
+
+    let start = Instant::now();
+    let (success, stderr) = run_monty(&["--max-sleep", "0.001", script.to_str().expect("utf-8 path")]);
+
+    assert!(success, "unexpected stderr: {stderr}");
+    assert!(start.elapsed().as_secs() < 5, "the sleep was not capped");
+}
+
+#[test]
+fn mount_write_limit_is_enforced_from_cli_spec() {
+    let host_dir = TempDir::new().expect("tempdir should be created");
+    let script_dir = script_dir("from pathlib import Path\nPath('/mnt/out.txt').write_text('hello')\n");
+    let mount = format!("{}::/mnt::rw::4", host_dir.path().display());
+    let script = script_dir.path().join("script.py");
+
+    let (success, stderr) = run_monty(&["-m", &mount, script.to_str().expect("utf-8 path")]);
+
+    assert!(!success, "CLI should fail when the configured write limit is exceeded");
+    assert!(
+        stderr.contains("OSError: disk write limit of 4 bytes exceeded"),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+#[test]
+fn invalid_write_limit_is_rejected_during_mount_parsing() {
+    let script_dir = script_dir("1\n");
+    let mount = format!("{}::/mnt::rw::abc", script_dir.path().display());
+    let script = script_dir.path().join("script.py");
+
+    let (success, stderr) = run_monty(&["-m", &mount, script.to_str().expect("utf-8 path")]);
+
+    assert!(!success, "CLI should reject invalid mount write limits");
+    assert_eq!(
+        stderr,
+        "error: invalid write limit 'abc' in '".to_owned() + &mount + "': expected a non-negative integer"
+    );
+}
+
+#[test]
+fn path_and_os_mutation_contracts_on_native_mounts() {
+    let code = r"
+from pathlib import Path
+import os
+source = Path('before.txt')
+source.write_text('hello')
+target = source.rename(target='after.txt')
+assert target == Path('after.txt')
+assert target.read_text() == 'hello'
+assert target.replace(target=Path('final.txt')) == Path('final.txt')
+assert Path('final.txt').read_text() == 'hello'
+assert os.rename('final.txt', 'before.txt') is None
+assert os.replace('before.txt', 'after.txt') is None
+assert Path('after.txt').stat(follow_symlinks=True).st_size == 5
+assert Path('after.txt').unlink(missing_ok=False) is None
+assert Path('after.txt').unlink(missing_ok=True) is None
+assert list(Path('.').iterdir()) == []
+";
+    let script_dir = script_dir(code);
+    let script = script_dir.path().join("script.py");
+    for mode in ["rw", "overlay"] {
+        let host_dir = TempDir::new().unwrap();
+        let mount = format!("{}::/data::{mode}", host_dir.path().display());
+        let (success, stderr) = run_monty(&["--mount", &mount, "--cwd", "/data", script.to_str().unwrap()]);
+        assert!(success, "{mode}: {stderr}");
+    }
+}
